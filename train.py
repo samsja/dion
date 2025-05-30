@@ -5,6 +5,7 @@ import time
 import torch
 import torch.distributed as dist
 import uuid
+import wandb
 
 from dataclasses import dataclass
 from torch.distributed.device_mesh import init_device_mesh
@@ -15,7 +16,7 @@ from tqdm import tqdm
 from typing import Optional
 
 from dion import Dion
-from Muon import MuonMoonlight
+from muon import MuonMoonlight
 from gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from gpt_utils import DistributedDataLoader
 
@@ -187,7 +188,6 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=None)
 
     # ---------- wandb logging ----------
-    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument(
         "--wandb_project_name", type=str, default=None, help="Wandb project name"
     )
@@ -258,32 +258,23 @@ def main():
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
 
     if MASTER_PROCESS and not cli_args.debug:
-        if cli_args.no_wandb:
-            from fake_wandb import FakeWandB
-
-            wandb_log = os.path.join(logdir, "wandb.log")
-            wandb = FakeWandB(wandb_log)
-        else:
-            import wandb
-
-            assert args.wandb_project_name, "wandb project name is required"
-
-        wandb.login(
-            key=os.environ.get("WANDB_API_KEY"),
-            host=os.environ.get("WANDB_HOST"),
-            timeout=0,
-        )
-        opt_name = f"{args.optimizer}+{args.scalar_opt}"
-        run_name = (
-            f"({opt_name})_bs={args.batch_size}_lr={args.lr}_sp={args.rank_fraction}"
-        )
-        if cli_args.dp_size is not None:
-            run_name += (
-                f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
+        if args.wandb_project_name:
+            wandb.login(
+                key=os.environ.get("WANDB_API_KEY"),
+                host=os.environ.get("WANDB_HOST"),
+                timeout=0,
             )
-        if cli_args.wandb_job_name:
-            run_name += f"_{cli_args.wandb_job_name}"
-        wandb.init(project=args.wandb_project_name, name=run_name, config=args.__dict__)
+            opt_name = f"{args.optimizer}+{args.scalar_opt}"
+            run_name = f"({opt_name})_bs={args.batch_size}_lr={args.lr}_sp={args.rank_fraction}"
+            if cli_args.dp_size is not None:
+                run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
+            if cli_args.wandb_job_name:
+                run_name += f"_{cli_args.wandb_job_name}"
+            wandb.init(
+                project=args.wandb_project_name, name=run_name, config=args.__dict__
+            )
+        else:
+            print0("Not using wandb beacuse wandb_project_name is not set.")
 
     # --- DataLoader Setup ---
     if cli_args.debug:
@@ -439,8 +430,19 @@ def main():
             for group in param_groups:
                 if group["algorithm"] == args.scalar_opt:
                     scalar_param_groups.append(group)
+            if device_mesh is not None:
+                data_parallel_mesh = device_mesh["dp"]
+                outer_shard_mesh = device_mesh["fs"]
+                inner_shard_mesh = device_mesh["tp"]
+            else:
+                data_parallel_mesh = model.process_group
+                outer_shard_mesh = None
+                inner_shard_mesh = None
             scalar_opt = Dion(
                 scalar_param_groups,
+                data_parallel_mesh=data_parallel_mesh,
+                outer_shard_mesh=outer_shard_mesh,
+                inner_shard_mesh=inner_shard_mesh,
                 data_parallel_grad_sync=False,  # gradients synced externally by pytorch DDP
                 lr=args.lr,
                 mu=args.mu,
@@ -524,7 +526,7 @@ def main():
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms"
             )
             print0(log_message)
-            if MASTER_PROCESS and not cli_args.debug:
+            if args.wandb_project_name and MASTER_PROCESS and not cli_args.debug:
                 wandb.log(
                     {
                         "val/loss": val_loss,
@@ -572,7 +574,7 @@ def main():
 
         # Approximate updated training time just before logging
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        if MASTER_PROCESS and not cli_args.debug:
+        if args.wandb_project_name and MASTER_PROCESS and not cli_args.debug:
             wandb.log(
                 {
                     "train/loss": train_loss.item(),

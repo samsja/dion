@@ -2,6 +2,7 @@ import math
 import os
 import torch
 import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Replicate
 
 
 def zeropower_via_svd(G, steps=None):
@@ -10,7 +11,7 @@ def zeropower_via_svd(G, steps=None):
 
 
 @torch.compile
-def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
+def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
     """
     Newton-Schulz iteration to approximate the orthogonalization of G.
     """
@@ -60,13 +61,11 @@ class MuonKellerJordan(torch.optim.Optimizer):
         )
         super().__init__(params, defaults)
 
-        print("Muon optimizer is being initialized...")
-        print(f"Muon optimizer initialized with backend: {defaults['backend']}")
-
-        # Ensure we enter the for loop
-        print("Iterating over parameter groups during initialization:")
+        # Make sure no parameters are DTensor
         for group in self.param_groups:
-            print(f" - Found parameter group with backend: {group['backend']}")
+            for p in group["params"]:
+                if isinstance(p, DTensor):
+                    raise NotImplementedError("DTensor parameters not supported.")
 
     def step(self):
         for group in self.param_groups:
@@ -165,6 +164,7 @@ class MuonMoonlight(torch.optim.Optimizer):
         adamw_params = list(adamw_params) if adamw_params is not None else []
         params = muon_params + adamw_params
         super().__init__(params, defaults)
+
         # Sort parameters into those for which we will use Muon, and those for which we will not
         for p in muon_params:
             # Use Muon for every parameter in muon_params which is >= 2D and doesn't look like an embedding or head layer
@@ -183,6 +183,8 @@ class MuonMoonlight(torch.optim.Optimizer):
         return adjusted_lr
 
     def adjust_lr_spectral_norm(self, lr, param_shape):
+        # Adjust from spectral norm 1 to RMS operator norm 1
+        # https://arxiv.org/abs/2310.17813
         fan_out, fan_in = param_shape[:2]
         adjusted_lr = lr * math.sqrt(fan_out / fan_in)
         return adjusted_lr
@@ -230,7 +232,27 @@ class MuonMoonlight(torch.optim.Optimizer):
                     g = g.add(buf, alpha=momentum)
                 else:
                     g = buf
-                u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
+
+                if isinstance(g, DTensor):
+                    # all-gather into full unsharded matrix
+                    replicate = [Replicate() for _ in g.placements]
+                    g_local = g.redistribute(placements=replicate).to_local()
+
+                    # calculate muon update
+                    u_local = zeropower_via_newtonschulz5(
+                        g_local, steps=group["ns_steps"]
+                    )
+
+                    # convert back to DTensor and re-shard to original placements
+                    u = DTensor.from_local(
+                        u_local,
+                        device_mesh=g.device_mesh,
+                        placements=replicate,
+                        run_check=False,
+                    ).redistribute(placements=g.placements)
+
+                else:
+                    u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"])
 
                 # scale update
                 if group["adjust_lr"] == "spectral_norm":
