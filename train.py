@@ -15,6 +15,7 @@ from tqdm import tqdm
 from typing import Optional
 
 from dion import Dion
+from Muon import MuonMoonlight
 from gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from gpt_utils import DistributedDataLoader
 
