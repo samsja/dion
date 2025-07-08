@@ -22,7 +22,10 @@ To quickly train a 160M model, run:
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/160m.yaml
 ``` 
- 
+
+## Faster Dion for lower ranks
+
+Gagik Magakyan and Ying Fan contributed to this.
 
 ## Citation
 
