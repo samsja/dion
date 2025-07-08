@@ -349,7 +349,10 @@ class Dion(Optimizer):
         rank: int = 8,
         power_iters: int = 1,
         epsilon: float = 1e-8,
-        approx_method: str = "rcqr",
+        approx_method: str = "qr",
+        total_steps: int = 3000,
+        qr_warmup: float = 0.05,
+        efficient: bool = False
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -382,6 +385,9 @@ class Dion(Optimizer):
         self.power_iters = power_iters
         self.epsilon = torch.tensor(epsilon)
         self.approx_method = approx_method
+        self.total_steps = total_steps
+        self.qr_warmup = qr_warmup
+        self.efficient = efficient 
 
         print(
             f"Dion optimizer initialized with:\n"
@@ -432,6 +438,11 @@ class Dion(Optimizer):
                     if not state:
                         self._init_opt_state_dion(param, state)
 
+                    approx_method = self.approx_method
+                    if self.efficient and step >= (self.total_steps * self.qr_warmup):
+                        # Use Cholesky QR with fallback after landscape becomes well-conditioned
+                        approx_method = "cqr"
+
                     # Apply update
                     Q_new = dion_update(
                         X=param,
@@ -440,7 +451,7 @@ class Dion(Optimizer):
                         lr=lr,
                         mu=mu,
                         weight_decay=weight_decay,
-                        approx_method=self.approx_method,
+                        approx_method=approx_method,
                         power_iters=self.power_iters,
                         epsilon=self.epsilon,
                     )

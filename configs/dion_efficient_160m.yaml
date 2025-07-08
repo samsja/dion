@@ -16,13 +16,13 @@ warmup_ratio: 0.0
 warmdown_ratio: 0.2
 
 # — Optimizer & Hyperparameters —
-
-adam_lr: 0.002
+rank_fraction: 0.5 
 mu: 0.95
 beta: 0.9
 weight_decay: 0.01
-rank_fraction: 1.0
+qr_warmup: 0.05 
 oversample: 1.25
+adam_lr: 0.002
 
 # — Validation & Checkpointing —
 val_loss_every: 125
@@ -30,7 +30,7 @@ val_tokens: 10485760
 save_every: 0
 
 # — Weights & Biases logging —
-wandb_project_name: dion-ref
+wandb_project_name: dion-exp
 wandb_job_name: null
 no_wandb: false
 
@@ -45,10 +45,9 @@ debug: false
 no_compile: false
 
 
-optimizer: dion_kj #muon_moonlight
+optimizer: dion 
 scalar_opt: lion
-muon_adjust_lr: spectral_norm
+# muon_adjust_lr: spectral_norm
 lr: 0.02
 approx_method: qr
-warmup_steps: 2
-recompute_period: 10
+efficient: true

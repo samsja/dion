@@ -16,11 +16,9 @@ from typing import Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
-from opts.dion import Dion as DionOld
-from opts.dion_KJ import DionKJ
-from opts.dion_KJplus import DionKJPlus
-from opts.dion_cqr import DionCQR
-from opts.dion_dist import Dion, DionMixedPrecisionConfig
+from opts.dion import Dion 
+from opts.dion_dist import Dion as Dion_Dist
+from opts.dion_dist import DionMixedPrecisionConfig
 from opts.muon import MuonMoonlight
  
 
@@ -54,8 +52,9 @@ class Hyperparameters:
     wandb_project_name: str = "test"
 
     # Optimizer
-    optimizer: str = "dion_kj"
+    optimizer: str = "dion"
     scalar_opt: str = "lion"
+    efficient: bool = False
     muon_adjust_lr: str = "spectral_norm"  # for Muon only
 
     # Hyperparameters
@@ -66,12 +65,10 @@ class Hyperparameters:
     weight_decay: float = 0.01
     rank_fraction: float = 0.125
     oversample: float = 1.25
-
-    warmup_steps: int = 2  # for DionNorm optimizer
-    recompute_period: int = 8  # for DionNorm optimizers
-    qr_warmup: int = 200  # num iterations for using first QR in DionNorm optimizers
+    qr_warmup: float = 0.05
+    
     power_iters: int = 1
-    approx_method: str = "rcqr"  # for DionOld and DionNorm optimizers 
+    approx_method: str = "qr"  # for DionOld and DionNorm optimizers 
 
 # Helper function to only print on global rank 0
 MASTER_PROCESS = False
@@ -165,6 +162,9 @@ def main():
     # ---------- optimizer ----------
     parser.add_argument(
         "--optimizer", type=str, default=None, help="Choice of optimizer algorithm"
+    )
+    parser.add_argument(
+        "--efficient", action="store_true", help="Use faster Dion with CQR trick"
     )
     parser.add_argument(
         "--scalar_opt", type=str, help="Optimizer for scalar parameters", default=None
@@ -285,6 +285,14 @@ def main():
     args = override_args_from_cli(args, cli_args)
     if cli_args.inv_rank_fraction:
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
+    
+    if args.efficient == True:
+        if args.rank_fraction > 0.5:
+            raise ValueError(
+                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup" \
+                "for rank_fraction=1 is under development"
+            )
+
 
     if MASTER_PROCESS and not cli_args.debug:
         if cli_args.no_wandb:
@@ -440,7 +448,7 @@ def main():
         )
 
     # Create the main optimizer
-    if args.optimizer == "dion":
+    if args.optimizer == "dion_dist":
         if device_mesh is not None:
             data_parallel_mesh = device_mesh["dp"]
             outer_shard_mesh = device_mesh["fs"]
@@ -449,7 +457,7 @@ def main():
             data_parallel_mesh = model.process_group
             outer_shard_mesh = None
             inner_shard_mesh = None
-        opt = Dion(
+        opt = Dion_Dist(
             param_groups,
             data_parallel_mesh=data_parallel_mesh,
             outer_shard_mesh=outer_shard_mesh,
@@ -461,63 +469,27 @@ def main():
             weight_decay=args.weight_decay,
             mixed_precision_config=DionMixedPrecisionConfig(),
         )
-    elif args.optimizer == "dion_old":
+    elif args.optimizer == "dion":
         assert device_mesh is None, "Old version of Dion does not support device mesh"
         assert cli_args.approx_method is not None
-        opt = DionOld(
+        opt = Dion(
             param_groups,
             lr=args.lr,
             mu=args.mu,
             weight_decay=args.weight_decay,
             rank=round(args.rank_fraction * args.model_dim),
             approx_method=cli_args.approx_method,
-        )
-    elif args.optimizer == "dion_kj":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionKJ(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim), 
-            approx_method=args.approx_method,
-            warmup_steps=args.warmup_steps, recompute_period=args.recompute_period,  
-        )
-    elif args.optimizer == "dion_kjplus":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionKJPlus(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim), 
-            approx_method=args.approx_method,
-            warmup_steps=args.warmup_steps, recompute_period=args.recompute_period,  
-            total_steps=args.num_iterations,  # Total training steps
-            qr_warmup=args.qr_warmup,  # Warm-up factor for QR
-        )  
-    elif args.optimizer == "dion_cqr":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionCQR(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim),
-            approx_method=cli_args.approx_method, 
-            total_steps=args.num_iterations,  # Total training steps
-            qr_warmup=args.qr_warmup,  # Warm-up factor for QR
-        )
-
+            total_steps=args.num_iterations,
+            qr_warmup=args.qr_warmup,
+            efficient=args.efficient
+        ) 
     elif args.optimizer == "muon_moonlight":
         if args.scalar_opt == "adam":
             # separate optimizer will be used
             pass
         else:
             # hack to reuse scalar optimizer implementation inside Dion
+            #TBD: do we want to keep this or change
             scalar_param_groups = []
             for group in param_groups:
                 if group["algorithm"] == args.scalar_opt:
@@ -544,29 +516,6 @@ def main():
             lr=args.lr,
             betas=(0.9, 0.95),
             weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "dion_norm":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionNorm(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim),
-            approx_method=cli_args.approx_method,
-            warmup_steps=cli_args.warmup_steps, recompute_period=cli_args.recompute_period
-        )
-    elif args.optimizer == "dion_correct":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionCorrect(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim),
-            approx_method=cli_args.approx_method,
         )
     else:
         raise ValueError(f"Unsupported optimizer: {args.optimizer}")
