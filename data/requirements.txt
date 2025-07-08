@@ -1,0 +1,4 @@
+datasets
+tiktoken
+torch
+wandb
