@@ -1,0 +1,28 @@
+wandb_project_name: "dion"
+wandb_group_name: "dion_clion"
+mtp_depth: 0
+
+save_checkpoint: False
+seed: 0
+lr_schedule: "constant"
+optimizer: "dion"
+scalar_optimizer: "lion"
+
+n_layer: 12
+n_head: 6
+n_embd: 768
+sequence_length: 1024
+num_iterations: 589
+device_batch_size: 128
+batch_size: 4096
+
+lr: 0.01
+dataset: "finewebedu"
+
+sweep:
+  - warmdown_iters: [59] # 10, 25%
+    mu: 0.95
+    weight_decay: 0
+    warmup_iters: 0
+    sparsity: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    

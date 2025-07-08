@@ -1,0 +1,12 @@
+fineweb10B/
+pylog124M/
+__pycache__/
+logs/
+venv/
+wandb/ 
+output/
+scripts/data/
+scripts/logs/
+scripts/wandb/
+new_mtp/
+.venv/

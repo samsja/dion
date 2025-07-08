@@ -1,0 +1,11 @@
+numpy
+# PyTorch ≥2.6 so `from torch.distributed.fsdp import FSDPModule` works
+torch>=2.6
+huggingface-hub
+wandb
+einops 
+omegaconf
+# mamba-ssm
+datasets
+tiktoken
+lion-pytorch
