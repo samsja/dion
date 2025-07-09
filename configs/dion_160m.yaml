@@ -46,6 +46,5 @@ no_compile: false
 
 optimizer: dion 
 scalar_opt: lion
-#TBD muon_adjust_lr: spectral_norm 
 lr: 0.02
 approx_method: qr
