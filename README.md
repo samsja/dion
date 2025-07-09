@@ -25,9 +25,10 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yam
 
 ## Faster Dion for lower ranks
 
-Gagik Magakyan and Ying Fan contributed to this.
 
-## 🚀 Accelerating Optimization step with CQR (Cholesky QR)
+
+## 🚀 Accelerating Optimization step for lower ranks
+Gagik Magakyan and Ying Fan contributed to this.
 
 After a few warmup iterations, the expensive QR decomposition can be replaced with **CQR**, leading to **2–5× optimization step speedups**—and even more for larger models!
 
