@@ -131,9 +131,13 @@ def orthogonalize(
 
     # Cholesky QR (may not be numerically stable)
     elif method == "cqr":
-        R, _ = torch.linalg.cholesky_ex(P.T @ P, upper=True)
-        Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
-        return Q
+        R, info = torch.linalg.cholesky_ex(P.T @ P, upper=True)
+        if info.item() == 0:
+            Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
+            return Q
+        else:
+            Q, _ = torch.linalg.qr(P, mode="r")
+            return Q
 
     # Randomized Cholesky QR
     elif method == "rcqr":
