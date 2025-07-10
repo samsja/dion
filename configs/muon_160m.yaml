@@ -36,7 +36,7 @@ debug: false
 no_compile: false
 
 
-optimizer: muon 
+optimizer: muon_moonlight 
 scalar_opt: lion
 muon_adjust_lr: spectral_norm #TBD what is this
 lr: 0.02

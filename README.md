@@ -14,7 +14,7 @@ pip install -r requirements.txt
 To download the dataset, run:
 
 ```bash
-python data/cached_fineweb10B.py 8
+python data/cached_fineweb10B.py 16
 ```
 
 To quickly train a 160M model, run:

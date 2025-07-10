@@ -16,7 +16,7 @@ warmup_ratio: 0.0
 warmdown_ratio: 0.2
 
 # — Optimizer & Hyperparameters —
-rank_fraction: 1.0
+rank_fraction: 0.5
 mu: 0.95
 beta: 0.9
 weight_decay: 0.01
