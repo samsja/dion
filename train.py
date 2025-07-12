@@ -164,9 +164,6 @@ def main():
         "--optimizer", type=str, default=None, help="Choice of optimizer algorithm"
     )
     parser.add_argument(
-        "--efficient", action="store_true", help="Use faster Dion with CQR trick"
-    )
-    parser.add_argument(
         "--scalar_opt", type=str, help="Optimizer for scalar parameters", default=None
     )
     parser.add_argument("--lr", type=float, default=None, help="Learning rate")
@@ -287,6 +284,8 @@ def main():
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
     
     if args.efficient == True:
+        if MASTER_PROCESS:
+            print("Using efficient Dion optimizer")
         if args.rank_fraction > 0.5:
             raise ValueError(
                 "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup" \
@@ -311,11 +310,14 @@ def main():
             timeout=0,
         )
         opt_name = f"{args.optimizer}+{args.scalar_opt}"
-        if args.optimizer == "dion_norm" or args.optimizer == "dion_kj":
-            opt_name = f"{args.optimizer}+({args.warmup_steps},{args.recompute_period})+{args.scalar_opt}"
         run_name = (
-            f"({opt_name})_bs={args.batch_size}_lr={args.lr}_sp={args.rank_fraction}"
+            f"({opt_name})_bs={args.batch_size}_lr={args.lr}"
         )
+        if "dion" in args.optimizer:
+            run_name += f"_sp={args.rank_fraction}"
+            if args.efficient:
+                run_name += f"_eff=True"
+
         if cli_args.dp_size is not None:
             run_name += (
                 f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
@@ -496,7 +498,6 @@ def main():
                     scalar_param_groups.append(group)
             scalar_opt = Dion(
                 scalar_param_groups,
-                data_parallel_grad_sync=False,  # gradients synced externally by pytorch DDP
                 lr=args.lr,
                 mu=args.mu,
                 weight_decay=args.weight_decay,
