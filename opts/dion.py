@@ -136,7 +136,9 @@ def orthogonalize(
             Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
             return Q
         else:
-            Q, _ = torch.linalg.qr(P, mode="r")
+            # If CQR fails do standard QR. Note that if you are in the right
+            # regime this will happen rarely. 
+            Q, _ = torch.linalg.qr(P)
             return Q
 
     # Randomized Cholesky QR
