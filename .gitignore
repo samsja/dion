@@ -1,12 +1,10 @@
-fineweb10B/
+data/
 pylog124M/
 __pycache__/
 logs/
 venv/
 wandb/ 
-output/
-scripts/data/
-scripts/logs/
-scripts/wandb/
-new_mtp/
+output/ 
 .venv/
+submit.ipynb
+aztool/
