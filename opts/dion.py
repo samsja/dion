@@ -111,12 +111,6 @@ def orthogonalize(
         R, _ = torch.linalg.cholesky_ex(Q.T @ Q, upper=True)
         Q = torch.linalg.solve_triangular(R, Q, upper=True, left=False)
         return Q
-
-    # Flash QR
-    if method == "flash-qr":
-        # Always use sketch + fused kernel, whether m >= n or not.
-        return flash_orthogonalize(P, block_size=16, oversample=oversample)
-
     else:
         raise ValueError(f"Unknown orthogonalization method: {method}")
 
