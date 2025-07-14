@@ -25,9 +25,9 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yam
 
 
 ## 🚀 Accelerating Optimization step for lower ranks
-Gagik Magakyan and Ying Fan contributed to this.
 
-After a few warmup iterations, the expensive QR decomposition can be replaced with **CQR**, leading to **2–5× optimization step speedups**—and even more for larger models!
+
+After a few warmup iterations, the expensive QR decomposition can be replaced with **CQR**, leading to **2X** optimization step speedups.
 
 
 > ⚠️ **Note:** Speedup for **rank fraction = 1.0** is still under development. For models **larger than 10B**, you may need to **further reduce the rank fraction** to see benefits.

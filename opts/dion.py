@@ -7,7 +7,8 @@ from typing import Any, Dict, Tuple, Optional
 def extract_PQ(
     u: torch.Tensor,  # shape (n, m)
     Q_init: torch.Tensor,  # shape (m, rank)
-    method: str = "qr",
+    method: str,  # "svd", "qr", "cqr", "rcqr", "flash-qr"
+    fallback_method: str, # "svd", "qr", "cqr", "rcqr", "flash-qr"
     power_iters: int = 1,  # ignored for SVD method
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -38,7 +39,7 @@ def extract_PQ(
         Q = Q_init
         for _ in range(power_iters):
             P = u @ Q  # shape (n, rank)
-            P = orthogonalize(P, method=method)
+            P = orthogonalize(P, method=method, fallback_method = fallback_method)
             Q = u.T @ P  # shape (m, rank)
 
         """
@@ -113,6 +114,7 @@ def flash_orthogonalize(
 def orthogonalize(
     P: torch.Tensor,
     method: str,
+    fallback_method: str,
     oversample: float = 1.25,  # only used for method "rcqr"
 ) -> torch.Tensor:
     """
@@ -124,25 +126,24 @@ def orthogonalize(
     """
     m, n = P.shape
 
-    # Always use standard QR if matrix is square or wide
-    if method == "qr":
-        Q, _ = torch.linalg.qr(P)
-        return Q
-
-    # Cholesky QR (may not be numerically stable)
-    elif method == "cqr":
+    # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
+    if method == "cqr":
         R, info = torch.linalg.cholesky_ex(P.T @ P, upper=True)
         if info.item() == 0:
             Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
             return Q
         else:
-            # If CQR fails do standard QR. Note that if you are in the right
-            # regime this will happen rarely. 
-            Q, _ = torch.linalg.qr(P)
-            return Q
+            # If CQR fails do default method. Note that if you are in the right
+            # regime this will happen rarely.
+            method = fallback_method
+
+    # Always use standard QR if matrix is square or wide
+    if method == "qr" or m >= n:
+        Q, _ = torch.linalg.qr(P)
+        return Q
 
     # Randomized Cholesky QR
-    elif method == "rcqr":
+    if method == "rcqr":
         # Compute size k and round up to next multiple of 128
         k = math.ceil(oversample * n / 128.0) * 128
 
@@ -160,7 +161,7 @@ def orthogonalize(
         return Q
 
     # Flash QR
-    elif method == "flash-qr":
+    if method == "flash-qr":
         # Always use sketch + fused kernel, whether m >= n or not.
         return flash_orthogonalize(P, block_size=16, oversample=oversample)
 
@@ -168,7 +169,7 @@ def orthogonalize(
         raise ValueError(f"Unknown orthogonalization method: {method}")
 
 
-import pdb
+
 @torch.compile(dynamic=True)
 def dion_update(
     X: torch.Tensor,  # Model weights (modified in place)
@@ -178,6 +179,7 @@ def dion_update(
     mu: torch.Tensor,  # Momentum factor (scalar tensor)
     weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
     approx_method: str,  # Approximation method for low-rank factorization
+    fallback_approx_method: str,  # Fallback approximation method if CQR fails for efficient Dion
     power_iters: int,  # Number of power iterations
     epsilon: float,
 ) -> torch.Tensor:
@@ -195,6 +197,7 @@ def dion_update(
         u=M,
         Q_init=Q,
         method=approx_method,
+        fallback_method=fallback_approx_method,
         power_iters=power_iters,
     )
 
@@ -355,7 +358,7 @@ class Dion(Optimizer):
         rank: int = 8,
         power_iters: int = 1,
         epsilon: float = 1e-8,
-        approx_method: str = "qr",
+        approx_method: str = "qr",  # "qr", "cqr", "rcqr", "svd", "flash-qr"
         total_steps: int = 3000,
         qr_warmup: float = 0.05,
         efficient: bool = False
@@ -445,9 +448,11 @@ class Dion(Optimizer):
                         self._init_opt_state_dion(param, state)
 
                     approx_method = self.approx_method
+                    fallback_approx_method = None
                     if self.efficient and step >= (self.total_steps * self.qr_warmup):
                         # Use Cholesky QR with fallback after landscape becomes well-conditioned
                         approx_method = "cqr"
+                        fallback_approx_method = self.approx_method
 
                     # Apply update
                     Q_new = dion_update(
@@ -458,6 +463,7 @@ class Dion(Optimizer):
                         mu=mu,
                         weight_decay=weight_decay,
                         approx_method=approx_method,
+                        fallback_approx_method=fallback_approx_method,
                         power_iters=self.power_iters,
                         epsilon=self.epsilon,
                     )
