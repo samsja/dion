@@ -61,54 +61,7 @@ def extract_PQ(
         Q = Q.nan_to_num() * not_all_zero + Q_init * is_all_zero
 
         return P, Q
-
-
-def flash_orthogonalize(
-    A: torch.Tensor,
-    block_size: int = 16,
-    oversample: float = 1.25,  # keep same default as rcqr
-) -> torch.Tensor:
-    """
-    Block-fused QR that never materialises the full R.
-      A : (m, n) matrix to orthogonalise   (modified in-place)
-      block_size : number of columns processed together
-    The sketch S is generated on-the-fly so the call signature stays
-    compatible with `orthogonalize`.
-    """
-    m, n = A.shape
-    k = math.ceil(oversample * n / 128.0) * 128
-    assert n % block_size == 0, "`n` must be divisible by block_size"
-
-    # Gaussian sketch S  ~  N(0, 1/k)
-    std = math.sqrt(1.0 / k)
-    S = torch.empty((k, m), dtype=A.dtype, device=A.device).normal_(std=std)
-    SA = S @ A  # (k, n)   random projection
-
-    # --- the original kernel ------------------------------------------------
-    Q = SA.clone()
-    num_blocks = n // block_size
-    for blk in range(num_blocks):
-        c0, c1 = blk * block_size, (blk + 1) * block_size
-        Q_blk, A_blk = Q[:, c0:c1], A[:, c0:c1]
-
-        # subtract projections of previous blocks
-        for pblk in range(blk):
-            p0, p1 = pblk * block_size, (pblk + 1) * block_size
-            R = Q[:, p0:p1].T @ Q_blk
-            Q_blk.sub_(Q[:, p0:p1] @ R)
-            A_blk.sub_(A[:, p0:p1] @ R)
-
-        # classical Gram–Schmidt inside the block
-        for j in range(block_size):
-            if j:  # proj on previous vecs
-                dots = Q_blk[:, :j].T @ Q_blk[:, j]
-                Q_blk[:, j].sub_(Q_blk[:, :j] @ dots)
-                A_blk[:, j].sub_(A_blk[:, :j] @ dots)
-            nrm = torch.linalg.norm(Q_blk[:, j])
-            Q_blk[:, j].div_(nrm)
-            A_blk[:, j].div_(nrm)
-    # ------------------------------------------------------------------------
-    return A  # orthogonalised copy (same shape as input)
+ 
 
 
 def orthogonalize(
@@ -122,7 +75,6 @@ def orthogonalize(
         - "qr": Householder QR (torch.linalg.qr)
         - "cqr": Cholesky QR
         - "rcqr": Randomized Cholesky QR
-        - "flash-qr" : Block-fused randomised QR (no full R materialised)
     """
     m, n = P.shape
 
