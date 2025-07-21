@@ -2,7 +2,11 @@
 
 This repository provides a preliminary implementation of the Dion optimizer (https://arxiv.org/pdf/2504.05295).
 
-## ⚙️ Quick Start
+## 🔧 Requirements
+
+This code is written for modern PyTorch (version 2.6 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard`and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not guaranteed.
+
+## ⚡ Quick Start
 
 Most of the relevant code is located in the `scripts/` directory.
 
