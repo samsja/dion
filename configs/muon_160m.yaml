@@ -1,0 +1,42 @@
+
+# — Model —
+model_dim: 768
+n_layer: 12
+n_head: 6
+sequence_length: 1024
+vocab_size: 50304   # (implicitly set in code)
+
+# — Batching & Training —
+batch_size: 1024
+device_batch_size: 32
+num_iterations: 3000
+
+# — Learning‐rate schedule —
+warmup_ratio: 0.0
+warmdown_ratio: 0.2
+
+# — Optimizer & Hyperparameters —
+mu: 0.95
+beta: 0.9
+weight_decay: 0.01
+adam_lr: 0.002
+
+# — Validation & Checkpointing —
+val_loss_every: 125
+val_tokens: 10485760
+save_every: 0
+
+# — Weights & Biases logging —
+wandb_project_name: dion-exp
+wandb_job_name: null
+no_wandb: false
+
+# — Miscellaneous flags —
+debug: false
+no_compile: false
+
+
+optimizer: muon_moonlight 
+scalar_opt: lion
+muon_adjust_lr: spectral_norm #TBD what is this
+lr: 0.02

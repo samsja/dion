@@ -5,7 +5,6 @@ import time
 import torch
 import torch.distributed as dist
 import uuid
-import wandb
 
 from dataclasses import dataclass
 from torch.distributed.device_mesh import init_device_mesh
@@ -15,10 +14,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 from typing import Optional
 
-from dion import Dion
-from muon import MuonMoonlight
-from gpt_model import GPT, GPTConfig, parallelize_gpt_model
-from gpt_utils import DistributedDataLoader
+from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
+from models.gpt_utils import DistributedDataLoader
+from opts.dion import Dion 
+from opts.dion_dist import Dion as Dion_Dist
+from opts.dion_dist import DionMixedPrecisionConfig
+from opts.muon import MuonMoonlight
+ 
+
+import yaml
+from pathlib import Path
 
 
 @dataclass
@@ -44,22 +49,26 @@ class Hyperparameters:
     val_loss_every: int = 125
     val_tokens: int = 10485760
     save_every: int = 0
-    wandb_project_name: str = None
+    wandb_project_name: str = "test"
 
     # Optimizer
     optimizer: str = "dion"
     scalar_opt: str = "lion"
+    efficient: bool = False
     muon_adjust_lr: str = "spectral_norm"  # for Muon only
 
     # Hyperparameters
-    lr: float = 0.01
+    lr: float = 0.02
     adam_lr: float = 0.002
     mu: float = 0.95
     beta: float = 0.9
     weight_decay: float = 0.01
     rank_fraction: float = 0.125
     oversample: float = 1.25
-
+    qr_warmup: float = 0.05
+    
+    power_iters: int = 1
+    approx_method: str = "qr"  # for DionOld and DionNorm optimizers 
 
 # Helper function to only print on global rank 0
 MASTER_PROCESS = False
@@ -128,7 +137,13 @@ def override_args_from_cli(
 def main():
     # --- Command-line argument parsing ---
     parser = argparse.ArgumentParser(
-        description="Training script with input and output directories"
+    description="Training script with input and output directories"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        help="Path to a YAML file whose keys match train.py flags "
+             "(CLI values always override the YAML).",
     )
 
     parser.add_argument(
@@ -169,7 +184,7 @@ def main():
         type=int,
         default=None,
         help="Sparsity level for the optimizer",
-    )
+    ) 
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -188,6 +203,7 @@ def main():
     parser.add_argument("--warmup_ratio", type=float, default=None)
 
     # ---------- wandb logging ----------
+    parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument(
         "--wandb_project_name", type=str, default=None, help="Wandb project name"
     )
@@ -221,6 +237,16 @@ def main():
     )
 
     cli_args = parser.parse_args()
+    if cli_args.config:
+        # Read YAML → dict
+        cfg_path = Path(cli_args.config)
+        with cfg_path.open("r") as f:
+            yaml_cfg = yaml.safe_load(f)
+
+        # Copy any key the user did NOT supply on the CLI
+        for k, v in yaml_cfg.items():
+            if getattr(cli_args, k, None) is None:
+                setattr(cli_args, k, v)
 
     # --- Distributed setup ---
     device_mesh = init_distributed(
@@ -256,25 +282,49 @@ def main():
     args = override_args_from_cli(args, cli_args)
     if cli_args.inv_rank_fraction:
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
+    
+    if args.efficient == True:
+        if MASTER_PROCESS:
+            print("Using efficient Dion optimizer")
+        if args.rank_fraction > 0.5:
+            raise ValueError(
+                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup" \
+                "for rank_fraction=1 is under development"
+            )
+
 
     if MASTER_PROCESS and not cli_args.debug:
-        if args.wandb_project_name:
-            wandb.login(
-                key=os.environ.get("WANDB_API_KEY"),
-                host=os.environ.get("WANDB_HOST"),
-                timeout=0,
-            )
-            opt_name = f"{args.optimizer}+{args.scalar_opt}"
-            run_name = f"({opt_name})_bs={args.batch_size}_lr={args.lr}_sp={args.rank_fraction}"
-            if cli_args.dp_size is not None:
-                run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
-            if cli_args.wandb_job_name:
-                run_name += f"_{cli_args.wandb_job_name}"
-            wandb.init(
-                project=args.wandb_project_name, name=run_name, config=args.__dict__
-            )
+        if cli_args.no_wandb:
+            from fake_wandb import FakeWandB
+
+            wandb_log = os.path.join(logdir, "wandb.log")
+            wandb = FakeWandB(wandb_log)
         else:
-            print0("Not using wandb beacuse wandb_project_name is not set.")
+            import wandb
+
+            assert args.wandb_project_name, "wandb project name is required"
+
+        wandb.login(
+            key=os.environ.get("WANDB_API_KEY"),
+            host=os.environ.get("WANDB_HOST"),
+            timeout=0,
+        )
+        opt_name = f"{args.optimizer}+{args.scalar_opt}"
+        run_name = (
+            f"({opt_name})_bs={args.batch_size}_lr={args.lr}"
+        )
+        if "dion" in args.optimizer:
+            run_name += f"_sp={args.rank_fraction}"
+            if args.efficient:
+                run_name += f"_eff=True"
+
+        if cli_args.dp_size is not None:
+            run_name += (
+                f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
+            )
+        if cli_args.wandb_job_name:
+            run_name += f"_{cli_args.wandb_job_name}"
+        wandb.init(project=args.wandb_project_name, name=run_name, config=args.__dict__)
 
     # --- DataLoader Setup ---
     if cli_args.debug:
@@ -288,7 +338,7 @@ def main():
 
     if cli_args.debug:
         # train for just a few steps
-        args.num_iterations = 10
+        args.num_iterations = 300
         val_steps = min(val_steps, 2)
 
     assert args.batch_size % (B * data_parallel_size) == 0, "Invalid batch_size"
@@ -317,7 +367,7 @@ def main():
     # --- Model Initialization ---
     num_vocab = 50304  # nearest multiple of 128 for efficiency
     gpt_config = GPTConfig(
-        sequence_len=args.sequence_length,
+        block_size=args.sequence_length,
         vocab_size=num_vocab,
         n_layer=args.n_layer,
         n_head=args.n_head,
@@ -400,7 +450,7 @@ def main():
         )
 
     # Create the main optimizer
-    if args.optimizer == "dion":
+    if args.optimizer == "dion_dist":
         if device_mesh is not None:
             data_parallel_mesh = device_mesh["dp"]
             outer_shard_mesh = device_mesh["fs"]
@@ -409,7 +459,7 @@ def main():
             data_parallel_mesh = model.process_group
             outer_shard_mesh = None
             inner_shard_mesh = None
-        opt = Dion(
+        opt = Dion_Dist(
             param_groups,
             data_parallel_mesh=data_parallel_mesh,
             outer_shard_mesh=outer_shard_mesh,
@@ -419,31 +469,35 @@ def main():
             lr=args.lr,
             mu=args.mu,
             weight_decay=args.weight_decay,
+            mixed_precision_config=DionMixedPrecisionConfig(),
         )
+    elif args.optimizer == "dion":
+        assert device_mesh is None, "Old version of Dion does not support device mesh"
+        assert cli_args.approx_method is not None
+        opt = Dion(
+            param_groups,
+            lr=args.lr,
+            mu=args.mu,
+            weight_decay=args.weight_decay,
+            rank=round(args.rank_fraction * args.model_dim),
+            approx_method=cli_args.approx_method,
+            total_steps=args.num_iterations,
+            qr_warmup=args.qr_warmup,
+            efficient=args.efficient
+        ) 
     elif args.optimizer == "muon_moonlight":
         if args.scalar_opt == "adam":
             # separate optimizer will be used
             pass
         else:
             # hack to reuse scalar optimizer implementation inside Dion
+            #TBD: do we want to keep this or change
             scalar_param_groups = []
             for group in param_groups:
                 if group["algorithm"] == args.scalar_opt:
                     scalar_param_groups.append(group)
-            if device_mesh is not None:
-                data_parallel_mesh = device_mesh["dp"]
-                outer_shard_mesh = device_mesh["fs"]
-                inner_shard_mesh = device_mesh["tp"]
-            else:
-                data_parallel_mesh = model.process_group
-                outer_shard_mesh = None
-                inner_shard_mesh = None
             scalar_opt = Dion(
                 scalar_param_groups,
-                data_parallel_mesh=data_parallel_mesh,
-                outer_shard_mesh=outer_shard_mesh,
-                inner_shard_mesh=inner_shard_mesh,
-                data_parallel_grad_sync=False,  # gradients synced externally by pytorch DDP
                 lr=args.lr,
                 mu=args.mu,
                 weight_decay=args.weight_decay,
@@ -526,7 +580,7 @@ def main():
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms"
             )
             print0(log_message)
-            if args.wandb_project_name and MASTER_PROCESS and not cli_args.debug:
+            if MASTER_PROCESS and not cli_args.debug:
                 wandb.log(
                     {
                         "val/loss": val_loss,
@@ -574,7 +628,7 @@ def main():
 
         # Approximate updated training time just before logging
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        if args.wandb_project_name and MASTER_PROCESS and not cli_args.debug:
+        if MASTER_PROCESS and not cli_args.debug:
             wandb.log(
                 {
                     "train/loss": train_loss.item(),
