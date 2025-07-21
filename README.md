@@ -23,6 +23,8 @@ To quickly train a 160M model, run:
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml
 ``` 
 
+After the training you should be able to reproduce the first plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
+
 
 ## 🚀 Accelerating Optimization step for lower ranks
 
@@ -37,6 +39,7 @@ To train the accelerated 160M model:
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_efficient_160m.yaml
 ```
 
+After the training you should be able to reproduce the second plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
 
 
 # Citation 
