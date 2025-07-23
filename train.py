@@ -426,12 +426,13 @@ def main():
         )
     )
 
+    # Get the device mesh for the optimizer
     if device_mesh is not None:
-        data_parallel_mesh = device_mesh["dp"]
+        replicate_mesh = device_mesh["dp"]
         outer_shard_mesh = device_mesh["fs"]
         inner_shard_mesh = device_mesh["tp"]
     else:
-        data_parallel_mesh = model.process_group
+        replicate_mesh = model.process_group
         outer_shard_mesh = None
         inner_shard_mesh = None
 
@@ -440,10 +441,10 @@ def main():
     if args.optimizer == "dion":
         opt = Dion(
             param_groups,
-            data_parallel_mesh=data_parallel_mesh,
+            replicate_mesh=replicate_mesh,
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
-            data_parallel_grad_sync=cli_args.opt_grad_sync,
+            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
             rank_fraction=args.rank_fraction,
             lr=args.lr,
             mu=args.mu,

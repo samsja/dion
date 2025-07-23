@@ -64,13 +64,13 @@ class Dion(Optimizer):
 
     Args:
         params: Parameters for the optimizer.
-        data_parallel_mesh: DeviceMesh or ProcessGroup for (replicated) data parallel.
+        replicate_mesh: DeviceMesh or ProcessGroup for replicated data parallelism.
             Use DeviceMesh for hybrid sharded FSDP and ProcessGroup for DistributedDataParallel.
         outer_shard_mesh: Parameter sharding DeviceMesh, replicated during orthogonalization.
             This is the FS dimension in the paper.
         inner_shard_mesh: Parameter sharding DeviceMesh, sharded during orthogonalization.
             This is the TP dimension in the paper.
-        data_parallel_grad_sync: If True, optimizer handles data-parallel gradient sync.
+        replicate_mesh_grad_sync: If True, optimizer handles data-parallel gradient sync.
             If False, the optimizer expects gradients to be already synchronized.
         rank_fraction: r/d fraction for low-rank approximation. Used to compute the low-rank dimension.
             This may be specified per param-group to have different rank fractions.
@@ -90,10 +90,10 @@ class Dion(Optimizer):
     def __init__(
         self,
         params: ParamsT,
-        data_parallel_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
+        replicate_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
         outer_shard_mesh: Optional[DeviceMesh] = None,
         inner_shard_mesh: Optional[DeviceMesh] = None,
-        data_parallel_grad_sync: bool = True,
+        replicate_mesh_grad_sync: bool = True,
         rank_fraction: float = 1.0,
         rank_multiple_of: int = 1,
         lr: float = 0.01,
@@ -131,6 +131,10 @@ class Dion(Optimizer):
                 raise ValueError(
                     f"Outer shard mesh must be 1D, but got {outer_shard_mesh.ndim}D. Try using a 1D sub-mesh."
                 )
+            if outer_shard_mesh == replicate_mesh:
+                raise ValueError(
+                    "Outer shard mesh must be different from replicate mesh."
+                )
         if inner_shard_mesh is not None:
             if not isinstance(inner_shard_mesh, DeviceMesh):
                 raise ValueError(
@@ -139,6 +143,10 @@ class Dion(Optimizer):
             if inner_shard_mesh.ndim != 1:
                 raise ValueError(
                     f"Inner shard mesh must be 1D, but got {inner_shard_mesh.ndim}D. Try using a 1D sub-mesh."
+                )
+            if inner_shard_mesh == replicate_mesh:
+                raise ValueError(
+                    "Inner shard mesh must be different from replicate mesh."
                 )
             if inner_shard_mesh == outer_shard_mesh:
                 raise ValueError("Outer and inner shard meshes must be different.")
@@ -166,10 +174,10 @@ class Dion(Optimizer):
         # State here may change upon resharding a checkpoint, so we recompute it
         self._dion_state: Dict[torch.Tensor, DionParamState] = {}
 
-        self._data_parallel_mesh = data_parallel_mesh
+        self._replicate_mesh = replicate_mesh
         self._outer_shard_mesh = outer_shard_mesh
         self._inner_shard_mesh = inner_shard_mesh
-        self._data_parallel_grad_sync = data_parallel_grad_sync
+        self._replicate_mesh_grad_sync = replicate_mesh_grad_sync
 
         # Get global ranks for outer and inner shard meshes
         if self._outer_shard_mesh is not None and self._outer_shard_mesh.size() > 1:
@@ -214,17 +222,16 @@ class Dion(Optimizer):
 
             for param in group["params"]:
                 if param.grad is None:
-                    # TODO maybe we should skip parameters without gradient
-                    raise ValueError("Gradient is None.")
+                    continue
 
                 state = self.state[param]
                 dion_state = self._get_dion_state(param)
 
-                # Dion is intended to be used with data-parallel sync turned off
+                # Dion is intended to be used without gradient sync over the replicated data-parallel world
                 # For each parameter, we either all-reduce its gradient or compressed PQ states
-                # Except when data_parallel_grad_sync is False, in which case we assume that
+                # Except when replicate_mesh_grad_sync is False, in which case we assume that
                 # gradients are already synchronized before the optimizer step is called.
-                if self._data_parallel_grad_sync and not dion_state.all_reduce_PQ:
+                if self._replicate_mesh_grad_sync and not dion_state.all_reduce_PQ:
                     self._all_reduce_gradient(param)
 
                 # Call the corresponding update function
@@ -239,7 +246,7 @@ class Dion(Optimizer):
 
                     Q = state["Q"]
                     all_reduce_PQ = (
-                        self._data_parallel_grad_sync and dion_state.all_reduce_PQ
+                        self._replicate_mesh_grad_sync and dion_state.all_reduce_PQ
                     )
 
                     # Dion update for DTensor parameters
@@ -262,7 +269,7 @@ class Dion(Optimizer):
                             power_iters=self._power_iters,
                             oversample=self._oversample,
                             all_reduce_PQ=all_reduce_PQ,
-                            data_parallel_mesh=self._data_parallel_mesh,
+                            replicate_mesh=self._replicate_mesh,
                             inner_shard_mesh_dim=dion_state.inner_shard_mesh_dim,
                         )
                         # Shard new Q along the inner sharding dimension
@@ -372,22 +379,20 @@ class Dion(Optimizer):
 
     def _all_reduce_gradient(self, tensor: torch.Tensor):
         """
-        All-reduce the gradient of a tensor over the data-parallel world.
+        All-reduce the gradient of a tensor over the replicated data-parallel world.
         """
         assert tensor.grad is not None, "Gradient is None."
-        if self._data_parallel_mesh is None:
+        if self._replicate_mesh is None:
             # No data parallelism used, do nothing
             pass
-        elif isinstance(self._data_parallel_mesh, DeviceMesh):
+        elif isinstance(self._replicate_mesh, DeviceMesh):
             assert isinstance(tensor.grad, DTensor)
             reduced_grad = mesh_all_reduce_dtensor(
-                tensor.grad, reduce_mesh=self._data_parallel_mesh, reduce_op="avg"
+                tensor.grad, reduce_mesh=self._replicate_mesh, reduce_op="avg"
             )
             tensor.grad = reduced_grad
-        elif isinstance(self._data_parallel_mesh, ProcessGroup):
-            dist.all_reduce(
-                tensor.grad, op=ReduceOp.AVG, group=self._data_parallel_mesh
-            )
+        elif isinstance(self._replicate_mesh, ProcessGroup):
+            dist.all_reduce(tensor.grad, op=ReduceOp.AVG, group=self._replicate_mesh)
         else:
             raise ValueError(
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
@@ -411,11 +416,11 @@ class Dion(Optimizer):
         # Check for allowed DeviceMesh and DTensor combinations
         # We only allow DTensor + DeviceMesh or regular Tensor + ProcessGroup
         using_device_mesh = (
-            isinstance(self._data_parallel_mesh, DeviceMesh)
+            isinstance(self._replicate_mesh, DeviceMesh)
             or isinstance(self._outer_shard_mesh, DeviceMesh)
             or isinstance(self._inner_shard_mesh, DeviceMesh)
         )
-        using_process_group = isinstance(self._data_parallel_mesh, ProcessGroup)
+        using_process_group = isinstance(self._replicate_mesh, ProcessGroup)
         if using_device_mesh and not isinstance(x, DTensor):
             raise ValueError("When using DeviceMesh, all parameters must be DTensor.")
         if using_process_group and isinstance(x, DTensor):
@@ -584,23 +589,23 @@ class Dion(Optimizer):
         else:
             # Make sure all DP ranks have the same Q
             Q = torch.randn(Q_shape, device=param.device, dtype=Q_dtype)
-            self._data_parallel_broadcast(Q)
+            self._replicate_mesh_broadcast(Q)
 
         state["Q"] = Q
 
-    def _data_parallel_broadcast(self, tensor: torch.Tensor):
+    def _replicate_mesh_broadcast(self, tensor: torch.Tensor):
         """
-        Broadcast a tensor from rank 0 over the data-parallel world.
+        Broadcast a tensor from rank 0 over the replicated data-parallel world.
         Tensor is modified in place.
         """
-        if self._data_parallel_mesh is None:
+        if self._replicate_mesh is None:
             # No data parallelism used, do nothing
             pass
-        elif isinstance(self._data_parallel_mesh, DeviceMesh):
-            for group in self._data_parallel_mesh.get_all_groups():
+        elif isinstance(self._replicate_mesh, DeviceMesh):
+            for group in self._replicate_mesh.get_all_groups():
                 dist.broadcast(tensor, group=group, group_src=0)
-        elif isinstance(self._data_parallel_mesh, ProcessGroup):
-            dist.broadcast(tensor, group=self._data_parallel_mesh, group_src=0)
+        elif isinstance(self._replicate_mesh, ProcessGroup):
+            dist.broadcast(tensor, group=self._replicate_mesh, group_src=0)
         else:
             raise ValueError(
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
@@ -786,7 +791,7 @@ def dion_update_dtensor(
     power_iters: int,
     oversample: float = 1.25,
     all_reduce_PQ: bool = True,
-    data_parallel_mesh: Optional[Tuple[int]] = None,
+    replicate_mesh: Optional[Tuple[int]] = None,
     inner_shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
     """
@@ -807,7 +812,7 @@ def dion_update_dtensor(
         Q,
         power_iters=power_iters,
         oversample=oversample,
-        all_reduce_mesh=data_parallel_mesh if all_reduce_PQ else None,
+        all_reduce_mesh=replicate_mesh if all_reduce_PQ else None,
         inner_shard_mesh_dim=inner_shard_mesh_dim,
     )
 
