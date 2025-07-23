@@ -20,9 +20,9 @@ from typing import Optional
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
 from opts.dion import Dion
-from opts.dion_dist import Dion as Dion_Dist
-from opts.dion_dist import DionMixedPrecisionConfig
-from opts.muon import MuonMoonlight
+from opts.muon import Muon
+from opts.dion_reference import Dion as DionReference
+from opts.muon_reference import MuonMoonlight as MuonReference
 
 
 @dataclass
@@ -99,6 +99,7 @@ def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
         device = f"cuda:{local_rank}"
         torch.cuda.set_device(device)
         print0(f"Initialized DDP with world size {world_size}")
+
     else:
         # Use device mesh for distributed training
         # All mesh dimensions must be specified
@@ -284,8 +285,7 @@ def main():
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
 
     if args.efficient == True:
-        if MASTER_PROCESS:
-            print("Using efficient Dion optimizer")
+        print0("Using efficient Dion optimizer")
         if args.rank_fraction > 0.5:
             raise ValueError(
                 "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
@@ -403,54 +403,42 @@ def main():
     matrix_params = list(raw_model.transformer.h.parameters())
     embedding_params = list(raw_model.transformer.wte.parameters())
     lm_head_params = list(raw_model.lm_head.parameters())
-    param_groups = [dict(params=matrix_params, algorithm="dion")]
-    optimizers = []
+    param_groups = [dict(params=matrix_params)]
 
-    # Get params for scalar optimzer
-    if args.scalar_opt == "adam":
-        # Separate AdamW optimizer for scalar parameters
-        print0(f"Using separate AdamW for scalar parameters with lr={args.adam_lr}")
-        adam_opt = torch.optim.AdamW(
-            embedding_params + lm_head_params,
-            lr=args.adam_lr,
-            betas=(0.9, 0.95),
+    # Create parameter groups for scalar optimizer
+    assert args.scalar_opt in ["adamw", "lion", "clion"]
+    param_groups.append(
+        dict(
+            params=embedding_params,
+            algorithm=args.scalar_opt,
+            lr=args.lr,
+            betas=(0.95, 0.98),
             weight_decay=0,
-            fused=True,
         )
-        optimizers.append(adam_opt)
+    )
+    param_groups.append(
+        dict(
+            params=lm_head_params,
+            algorithm=args.scalar_opt,
+            lr=args.lr / math.sqrt(args.model_dim),  # scale LR for lm_head
+            betas=(0.95, 0.98),
+            weight_decay=0,
+        )
+    )
 
+    if device_mesh is not None:
+        data_parallel_mesh = device_mesh["dp"]
+        outer_shard_mesh = device_mesh["fs"]
+        inner_shard_mesh = device_mesh["tp"]
     else:
-        assert args.scalar_opt in ["lion", "clion"]
-        param_groups.append(
-            dict(
-                params=embedding_params,
-                algorithm=args.scalar_opt,
-                lr=args.lr,
-                betas=(0.95, 0.98),
-                weight_decay=0,
-            )
-        )
-        param_groups.append(
-            dict(
-                params=lm_head_params,
-                algorithm=args.scalar_opt,
-                lr=args.lr / math.sqrt(args.model_dim),
-                betas=(0.95, 0.98),
-                weight_decay=0,
-            )
-        )
+        data_parallel_mesh = model.process_group
+        outer_shard_mesh = None
+        inner_shard_mesh = None
 
     # Create the main optimizer
-    if args.optimizer == "dion_dist":
-        if device_mesh is not None:
-            data_parallel_mesh = device_mesh["dp"]
-            outer_shard_mesh = device_mesh["fs"]
-            inner_shard_mesh = device_mesh["tp"]
-        else:
-            data_parallel_mesh = model.process_group
-            outer_shard_mesh = None
-            inner_shard_mesh = None
-        opt = Dion_Dist(
+    optimizers = []
+    if args.optimizer == "dion":
+        opt = Dion(
             param_groups,
             data_parallel_mesh=data_parallel_mesh,
             outer_shard_mesh=outer_shard_mesh,
@@ -460,45 +448,50 @@ def main():
             lr=args.lr,
             mu=args.mu,
             weight_decay=args.weight_decay,
-            mixed_precision_config=DionMixedPrecisionConfig(),
         )
-    elif args.optimizer == "dion":
-        assert device_mesh is None, "Old version of Dion does not support device mesh"
+    elif args.optimizer == "muon":
+        if device_mesh is not None:
+            assert not (
+                cli_args.fs_size > 1 and cli_args.dp_size > 1
+            ), "Hybrid sharded data parallel is not supported by Muon."
+            assert cli_args.tp_size == 1, "Tensor parallel is not supported by Muon."
+            distributed_mesh = (
+                device_mesh["dp"] if cli_args.dp_size > 1 else device_mesh["fs"]
+            )
+        else:
+            distributed_mesh = model.process_group  # using DDP
+        opt = Muon(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=args.lr,
+            mu=args.mu,
+            weight_decay=args.weight_decay,
+        )
+    elif args.optimizer == "dion_reference":
+        assert (
+            device_mesh is None
+        ), "Simplified version of Dion does not support device mesh"
         assert cli_args.approx_method is not None
-        opt = Dion(
+        opt = DionReference(
             param_groups,
             lr=args.lr,
             mu=args.mu,
             weight_decay=args.weight_decay,
             rank=round(args.rank_fraction * args.model_dim),
             approx_method=cli_args.approx_method,
-            total_steps=args.num_iterations,
-            qr_warmup=args.qr_warmup,
+            qr_warmup_steps=int(args.qr_warmup * args.num_iterations),
             efficient=args.efficient,
         )
     elif args.optimizer == "muon_moonlight":
-        if args.scalar_opt == "adam":
-            # separate optimizer will be used
-            pass
-        else:
-            # hack to reuse scalar optimizer implementation inside Dion
-            # TBD: do we want to keep this or change
-            scalar_param_groups = []
-            for group in param_groups:
-                if group["algorithm"] == args.scalar_opt:
-                    scalar_param_groups.append(group)
-            scalar_opt = Dion(
-                scalar_param_groups,
-                lr=args.lr,
-                mu=args.mu,
-                weight_decay=args.weight_decay,
-            )
-            optimizers.append(scalar_opt)
-        opt = MuonMoonlight(
+        assert (
+            device_mesh is None
+        ), "Simplified version of Dion does not support device mesh"
+        opt = MuonReference(
             muon_params=matrix_params,
-            adamw_params=None,
+            adamw_params=[pg for pg in param_groups if pg["algorithm"] == "adamw"],
+            lion_params=[pg for pg in param_groups if pg["algorithm"] == "lion"],
             lr=args.lr,
-            wd=args.weight_decay,
+            weight_decay=args.weight_decay,
             momentum=args.mu,
             adjust_lr=args.muon_adjust_lr,
         )

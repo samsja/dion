@@ -1,0 +1,436 @@
+import math
+import os
+import torch
+from torch.optim.optimizer import Optimizer, ParamsT
+from typing import Any, Dict, Tuple
+
+
+def extract_PQ(
+    u: torch.Tensor,  # shape (n, m)
+    Q_init: torch.Tensor,  # shape (m, rank)
+    method: str,  # "svd", "qr", "cqr", "rcqr"
+    fallback_method: str,  # "svd", "qr", "cqr", "rcqr"
+    power_iters: int = 1,  # ignored for SVD method
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Returns a rank-`rank` low-rank approximation of `u` by extracting
+    P and Q such that (approximately) u ≈ P @ Q^T.
+
+    The SVD method computes a truncated SVD. The power iteration method
+    uses iterative QR decompositions.
+    """
+    if method not in ("svd", "qr", "cqr", "rcqr"):
+        raise ValueError(f"Unknown method: {method}")
+
+    if method == "svd":
+        rank = Q_init.size(1)
+        U, S, V = torch.linalg.svd(u, full_matrices=False)
+        P = U[:, :rank]  # (n, rank)
+        S_r = S[:rank]
+        Q = V.T[:, :rank] * S_r.unsqueeze(0)  # (m, rank)
+        return P, Q
+
+    else:
+        if Q_init is None:
+            raise ValueError(
+                "For power iter methods, please supply a Q_init of shape (m, rank)."
+            )
+
+        # Power iteration method
+        Q = Q_init
+        for _ in range(power_iters):
+            P = u @ Q  # shape (n, rank)
+            P = orthogonalize(P, method=method, fallback_method=fallback_method)
+            Q = u.T @ P  # shape (m, rank)
+
+        # Fix all zero or NaN
+        if torch.all(u == 0):
+            P = torch.zeros_like(P)
+            Q = Q_init
+
+        return P, Q
+
+
+def orthogonalize(
+    P: torch.Tensor,
+    method: str,
+    fallback_method: str,  # only used for method "cqr"
+    oversample: float = 1.25,  # only used for method "rcqr"
+) -> torch.Tensor:
+    """
+    Orthogonalize the input matrix using the specified method.
+        - "qr": Householder QR (torch.linalg.qr)
+        - "cqr": Cholesky QR
+        - "rcqr": Randomized Cholesky QR
+    """
+    m, n = P.shape
+
+    # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
+    if method == "cqr":
+        R, info = torch.linalg.cholesky_ex(P.T @ P, upper=True)
+        if info.item() == 0:
+            Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
+            return Q
+        else:
+            # If CQR fails do default method. Note that if you are in the right
+            # regime this will happen rarely.
+            method = fallback_method
+
+    # Always use standard QR if matrix is square or wide
+    if method == "qr" or m >= n:
+        Q, _ = torch.linalg.qr(P)
+        return Q
+
+    # Randomized Cholesky QR
+    if method == "rcqr":
+        # Compute size k and round up to next multiple of 128
+        k = math.ceil(oversample * n / 128.0) * 128
+
+        # Generate random sketching matrix of shape (k, m)
+        std = math.sqrt(1.0 / k)
+        S = torch.empty((k, m), device=P.device, dtype=P.dtype).normal_(std=std)
+
+        # Calculate right triangular matrix R using standard QR, and solve for Q
+        _, R = torch.linalg.qr(S @ P, mode="r")
+        Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
+
+        # Apply another iteration of Cholesky QR to better orthogonalize Q
+        R, _ = torch.linalg.cholesky_ex(Q.T @ Q, upper=True)
+        Q = torch.linalg.solve_triangular(R, Q, upper=True, left=False)
+        return Q
+
+    raise ValueError(f"Unknown orthogonalization method: {method}")
+
+
+@torch.compile(dynamic=True)
+def dion_update(
+    X: torch.Tensor,  # Model weights (modified in place)
+    M: torch.Tensor,  # Momentum buffer (modified in place)
+    Q: torch.Tensor,  # Q matrix for power iteration
+    lr: torch.Tensor,  # Learning rate (scalar tensor)
+    mu: torch.Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+    approx_method: str,  # Approximation method for low-rank factorization
+    fallback_approx_method: str,  # Fallback approximation method if CQR fails for efficient Dion
+    power_iters: int,  # Number of power iterations
+    epsilon: float,
+) -> torch.Tensor:
+    """
+    Dion optimizer algorithm.
+    """
+    # Add new gradient to momentum
+    M.add_(X.grad)
+
+    # Compute low-rank approximation of M = P @ Q^T
+    P, R = extract_PQ(
+        u=M,
+        Q_init=Q,
+        method=approx_method,
+        fallback_method=fallback_approx_method,
+        power_iters=power_iters,
+    )
+
+    # Error feedback
+    # M = M - (1 - mu) * (P @ R.T)
+    M.addmm_(P, R.T, alpha=-(1 - mu))
+
+    # Column normalize R to get new Q
+    Q.copy_(R / (R.norm(dim=0, keepdim=True) + epsilon))
+
+    # Compute update scale factor
+    fan_out = X.size(0)
+    fan_in = X.size(1)
+    scale = (fan_out / fan_in) ** 0.5
+
+    return scale * P @ Q.T  # Return the update direction
+
+
+@torch.compile(dynamic=True)
+def adamw_update(
+    X: torch.Tensor,  # Model weights (modified in place)
+    M: torch.Tensor,  # Momentum buffer (modified in place)
+    V: torch.Tensor,  # Variance buffer (modified in place)
+    lr: torch.Tensor,  # Learning rate (scalar tensor)
+    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
+    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
+    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+    step: int,
+    epsilon: float,
+):
+    """
+    AdamW optimizer algorithm.
+    """
+    # Apply weight decay
+    X.mul_(1 - lr * weight_decay)
+
+    # Update momentum and variance
+    # M = beta1 * M + (1 - beta1) * X.grad
+    M.lerp_(X.grad, 1 - beta1)
+    # V = beta2 * V + (1 - beta2) * X.grad * X.grad
+    V.mul_(beta2).addcmul_(X.grad, X.grad, value=1 - beta2)
+
+    # Bias correction
+    bias_correction1 = 1 - beta1**step
+    bias_correction2 = 1 - beta2**step
+    bias_correction2_sqrt = bias_correction2.sqrt()
+
+    # The goal is to compute the following in-place:
+    # M = M / bias_correction1
+    # V = V / bias_correction2
+    # X = X - lr * M / (sqrt(V) + epsilon)
+
+    # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
+    denom = V.sqrt().div_(bias_correction2_sqrt).add_(epsilon)
+
+    # Adjust learning rate to include bias correction 1
+    adj_lr = lr / bias_correction1
+
+    # Weight update
+    # X = X - adj_lr * M / denom
+    X.addcdiv_(M, denom, value=-adj_lr)
+
+
+@torch.compile(dynamic=True)
+def lion_update(
+    X: torch.Tensor,  # Model weights (modified in place)
+    M: torch.Tensor,  # Momentum buffer (modified in place)
+    lr: torch.Tensor,  # Learning rate (scalar tensor)
+    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
+    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
+    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+):
+    """
+    Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
+    """
+    # Apply weight decay
+    X.mul_(1 - lr * weight_decay)
+
+    # Compute sign update
+    # U = sign(beta1 * M + (1 - beta1) * X.grad)
+    U = M.lerp(X.grad, 1 - beta1).sign_()
+
+    # Update momentum with new gradient
+    # M = beta2 * M + (1 - beta2) * X.grad
+    M.lerp_(X.grad, 1 - beta2)
+
+    # Weight update
+    # X = X - lr * U
+    X.add_(U, alpha=-lr)
+
+
+class Dion(Optimizer):
+    def __init__(
+        self,
+        params: ParamsT,
+        lr: float,
+        mu: float = 0.95,  # For Dion
+        betas: Tuple[float, float] = (0.9, 0.95),  # For AdamW and Lion
+        weight_decay: float = 0.01,
+        rank: int = 8,
+        power_iters: int = 1,
+        epsilon: float = 1e-8,
+        approx_method: str = "qr",  # "qr", "cqr", "rcqr", "svd"
+        qr_warmup_steps: int = 150,
+        efficient: bool = False,
+    ):
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if mu < 0.0:
+            raise ValueError(f"Invalid momentum factor (mu): {mu}")
+        if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
+            raise ValueError(f"Invalid betas: {betas}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if rank <= 0:
+            raise ValueError(f"Invalid rank value: {rank}")
+        if power_iters <= 0:
+            raise ValueError(f"Invalid power iterations: {power_iters}")
+        if approx_method not in ("qr", "cqr", "rcqr", "svd"):
+            raise ValueError(f"Unknown approximation method: {approx_method}")
+
+        defaults = dict(
+            lr=lr,
+            mu=mu,
+            beta1=betas[0],
+            beta2=betas[1],
+            weight_decay=weight_decay,
+            algorithm="dion",
+            step=0,
+        )
+        super().__init__(params, defaults)
+
+        self.rank = rank
+        self.power_iters = power_iters
+        self.epsilon = torch.tensor(epsilon)
+        self.approx_method = approx_method
+        self.qr_warmup_steps = qr_warmup_steps
+        self.efficient = efficient
+
+        print(
+            f"Dion optimizer initialized with:\n"
+            f"  - Learning rate: {lr}\n"
+            f"  - Momentum factor (mu): {mu}\n"
+            f"  - Weight decay: {weight_decay}\n"
+            f"  - Rank: {rank}\n"
+            f"  - Power iterations: {power_iters}\n"
+            f"  - Epsilon: {epsilon}\n"
+            f"  - Rank-r approximation method: {approx_method}\n"
+        )
+
+        # Check that all Dion parameters are 2D tensors
+        for group in self.param_groups:
+            if group["algorithm"] == "dion":
+                for p in group["params"]:
+                    if p.dim() != 2:
+                        raise ValueError(
+                            f"Expected matrix parameters to be 2D tensor, got {p.dim()}D."
+                        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+
+        for group in self.param_groups:
+            algo = group["algorithm"]
+            group["step"] += 1
+            step = group["step"]
+
+            # Wrap hyperparameters in tensors for torch.compile
+            lr = torch.tensor(group["lr"])
+            mu = torch.tensor(group["mu"])
+            beta1 = torch.tensor(group["beta1"])
+            beta2 = torch.tensor(group["beta2"])
+            weight_decay = torch.tensor(group["weight_decay"])
+
+            if algo == "dion":
+
+                total_params = sum(p.numel() for p in group["params"])
+                device = group["params"][0].device
+                # Create a flat buffer to hold the update direction for the entire parameter group.
+                updates_flat = torch.zeros(
+                    total_params, device=device, dtype=group["params"][0].dtype
+                )
+                curr_idx = 0
+
+                for i, param in enumerate(group["params"]):
+                    numel = param.numel()
+                    # Only the owner rank (defined by modulo over param index) computes the update.
+                    if i % world_size == rank:
+                        if param.grad is None:
+                            raise ValueError("Gradient is None.")
+
+                        # Get optimizer state for this parameter
+                        state = self.state[param]
+                        if not state:
+                            self._init_opt_state_dion(param, state)
+
+                        approx_method = self.approx_method
+                        fallback_approx_method = None
+                        if self.efficient and step >= self.qr_warmup_steps:
+                            # Use Cholesky QR with fallback after landscape becomes well-conditioned
+                            approx_method = "cqr"
+                            fallback_approx_method = self.approx_method
+
+                        # Apply update
+                        update = dion_update(
+                            X=param,
+                            M=state["momentum"],
+                            Q=state["Q"],
+                            lr=lr,
+                            mu=mu,
+                            weight_decay=weight_decay,
+                            approx_method=approx_method,
+                            fallback_approx_method=fallback_approx_method,
+                            power_iters=self.power_iters,
+                            epsilon=self.epsilon,
+                        )
+
+                        updates_flat[curr_idx : curr_idx + numel] = update.flatten()
+
+                    # Non-owner replicas leave this portion as zeros.
+                    curr_idx += numel
+
+                # All-reduce to gather computed update directions from all ranks.
+                # All-reduce is equivalent to all-gather here.
+                torch.distributed.all_reduce(
+                    updates_flat, op=torch.distributed.ReduceOp.SUM
+                )
+
+                curr_idx = 0
+                for param in group["params"]:
+                    numel = param.numel()
+                    update_tensor = updates_flat[curr_idx : curr_idx + numel].view_as(
+                        param
+                    )
+                    param.add_(update_tensor, alpha=-lr)
+                    param.add_(param, alpha=-weight_decay * lr)  # Apply weight decay
+                    curr_idx += numel
+
+            elif algo == "adamw":
+                for param in group["params"]:
+                    if param.grad is None:
+                        raise ValueError("Gradient is None.")
+
+                    # Get optimizer state for this parameter
+                    state = self.state[param]
+                    if not state:
+                        self._init_opt_state_adam(param, state)
+
+                    # Apply update
+                    adamw_update(
+                        X=param,
+                        M=state["momentum"],
+                        V=state["variance"],
+                        lr=lr,
+                        beta1=beta1,
+                        beta2=beta2,
+                        weight_decay=weight_decay,
+                        step=step,
+                        epsilon=self.epsilon,
+                    )
+
+            elif algo == "lion":
+                for param in group["params"]:
+                    if param.grad is None:
+                        raise ValueError("Gradient is None.")
+
+                    # Get optimizer state for this parameter
+                    state = self.state[param]
+                    if not state:
+                        self._init_opt_state_lion(param, state)
+
+                    # Apply update
+                    lion_update(
+                        X=param,
+                        M=state["momentum"],
+                        lr=lr,
+                        beta1=beta1,
+                        beta2=beta2,
+                        weight_decay=weight_decay,
+                    )
+
+            else:
+                raise ValueError(f"Unknown algorithm: {algo}")
+
+        return loss
+
+    def _init_opt_state_dion(self, param: torch.Tensor, state: Dict[str, Any]):
+        # Initialize momentum and Q for a 2D matrix parameter
+        state["momentum"] = torch.zeros_like(param)
+        r = min(self.rank, min(param.shape))
+        state["Q"] = torch.randn(
+            (param.size(1), r), device=param.device, dtype=param.dtype
+        )
+
+    def _init_opt_state_adam(self, param: torch.Tensor, state: Dict[str, Any]):
+        state["momentum"] = torch.zeros_like(param)
+        state["variance"] = torch.zeros_like(param)
+
+    def _init_opt_state_lion(self, param: torch.Tensor, state: Dict[str, Any]):
+        state["momentum"] = torch.zeros_like(param)

@@ -1,10 +1,10 @@
 numpy
 torch>=2.7.1
+triton
 huggingface-hub
 wandb
 einops 
 omegaconf
-# mamba-ssm
 datasets
 tiktoken
 lion-pytorch
