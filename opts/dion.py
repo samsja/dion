@@ -1,5 +1,6 @@
 import math
 import torch
+import os
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple, Optional
 
@@ -8,7 +9,7 @@ def extract_PQ(
     u: torch.Tensor,  # shape (n, m)
     Q_init: torch.Tensor,  # shape (m, rank)
     method: str,  # "svd", "qr", "cqr", "rcqr", "flash-qr"
-    fallback_method: str, # "svd", "qr", "cqr", "rcqr", "flash-qr"
+    fallback_method: str,  # "svd", "qr", "cqr", "rcqr", "flash-qr"
     power_iters: int = 1,  # ignored for SVD method
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -39,7 +40,7 @@ def extract_PQ(
         Q = Q_init
         for _ in range(power_iters):
             P = u @ Q  # shape (n, rank)
-            P = orthogonalize(P, method=method, fallback_method = fallback_method)
+            P = orthogonalize(P, method=method, fallback_method=fallback_method)
             Q = u.T @ P  # shape (m, rank)
 
         """
@@ -61,7 +62,6 @@ def extract_PQ(
         Q = Q.nan_to_num() * not_all_zero + Q_init * is_all_zero
 
         return P, Q
- 
 
 
 def orthogonalize(
@@ -115,7 +115,6 @@ def orthogonalize(
         raise ValueError(f"Unknown orthogonalization method: {method}")
 
 
-
 @torch.compile(dynamic=True)
 def dion_update(
     X: torch.Tensor,  # Model weights (modified in place)
@@ -132,9 +131,6 @@ def dion_update(
     """
     Dion optimizer algorithm.
     """
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
     # Add new gradient to momentum
     M.add_(X.grad)
 
@@ -152,23 +148,14 @@ def dion_update(
     M.addmm_(P, R.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
-    
-    # Normalize R for orthonormality  
-    Q = R / (R.norm(dim=0, keepdim=True) + epsilon)
-    
-
+    Q.copy_(R / (R.norm(dim=0, keepdim=True) + epsilon))
 
     # Compute update scale factor
     fan_out = X.size(0)
     fan_in = X.size(1)
-    scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
+    scale = (fan_out / fan_in) ** 0.5
 
-    # Apply weight update
-    # X = X - scaled_lr * (P @ Q.T)
-    X.addmm_(P, Q.T, alpha=-scaled_lr)
-
-    # Return new Q for next iteration
-    return Q
+    return scale * P @ Q.T  # Return the update direction
 
 
 @torch.compile(dynamic=True)
@@ -277,9 +264,6 @@ def lion_update(
     """
     Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
     """
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
     # Compute sign update
     # U = sign(beta1 * M + (1 - beta1) * X.grad)
     U = M.lerp(X.grad, 1 - beta1).sign_()
@@ -307,7 +291,7 @@ class Dion(Optimizer):
         approx_method: str = "qr",  # "qr", "cqr", "rcqr", "svd", "flash-qr"
         total_steps: int = 3000,
         qr_warmup: float = 0.05,
-        efficient: bool = False
+        efficient: bool = False,
     ):
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr}")
@@ -342,7 +326,7 @@ class Dion(Optimizer):
         self.approx_method = approx_method
         self.total_steps = total_steps
         self.qr_warmup = qr_warmup
-        self.efficient = efficient 
+        self.efficient = efficient
 
         print(
             f"Dion optimizer initialized with:\n"
@@ -371,6 +355,9 @@ class Dion(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = int(os.environ.get("RANK", "0"))
+
         for group in self.param_groups:
             algo = group["algorithm"]
             group["step"] += 1
@@ -384,36 +371,70 @@ class Dion(Optimizer):
             weight_decay = torch.tensor(group["weight_decay"])
 
             if algo == "dion":
+
+                total_params = sum(p.numel() for p in group["params"])
+                device = group["params"][0].device
+                # Create a flat buffer to hold the update direction for the entire parameter group.
+                updates_flat = torch.zeros(
+                    total_params, device=device, dtype=group["params"][0].dtype
+                )
+                curr_idx = 0
+
+                for i, param in enumerate(group["params"]):
+                    numel = param.numel()
+                    # Only the owner rank (defined by modulo over param index) computes the update.
+                    if i % world_size == rank:
+                        if param.grad is None:
+                            raise ValueError("Gradient is None.")
+
+                        # Get optimizer state for this parameter
+                        state = self.state[param]
+                        if not state:
+                            self._init_opt_state_dion(param, state)
+
+                        approx_method = self.approx_method
+                        fallback_approx_method = None
+                        if self.efficient and step >= (
+                            self.total_steps * self.qr_warmup
+                        ):
+                            # Use Cholesky QR with fallback after landscape becomes well-conditioned
+                            approx_method = "cqr"
+                            fallback_approx_method = self.approx_method
+
+                        # Apply update
+                        update = dion_update(
+                            X=param,
+                            M=state["momentum"],
+                            Q=state["Q"],
+                            lr=lr,
+                            mu=mu,
+                            weight_decay=weight_decay,
+                            approx_method=approx_method,
+                            fallback_approx_method=fallback_approx_method,
+                            power_iters=self.power_iters,
+                            epsilon=self.epsilon,
+                        )
+
+                        updates_flat[curr_idx : curr_idx + numel] = update.flatten()
+
+                    # Non-owner replicas leave this portion as zeros.
+                    curr_idx += numel
+
+                # All-reduce to gather computed update directions from all ranks.
+                # All-reduce is equivalent to all-gather here.
+                torch.distributed.all_reduce(
+                    updates_flat, op=torch.distributed.ReduceOp.SUM
+                )
+
+                curr_idx = 0
                 for param in group["params"]:
-                    if param.grad is None:
-                        raise ValueError("Gradient is None.")
-
-                    # Get optimizer state for this parameter
-                    state = self.state[param]
-                    if not state:
-                        self._init_opt_state_dion(param, state)
-
-                    approx_method = self.approx_method
-                    fallback_approx_method = None
-                    if self.efficient and step >= (self.total_steps * self.qr_warmup):
-                        # Use Cholesky QR with fallback after landscape becomes well-conditioned
-                        approx_method = "cqr"
-                        fallback_approx_method = self.approx_method
-
-                    # Apply update
-                    Q_new = dion_update(
-                        X=param,
-                        M=state["momentum"],
-                        Q=state["Q"],
-                        lr=lr,
-                        mu=mu,
-                        weight_decay=weight_decay,
-                        approx_method=approx_method,
-                        fallback_approx_method=fallback_approx_method,
-                        power_iters=self.power_iters,
-                        epsilon=self.epsilon,
+                    numel = param.numel()
+                    update_tensor = updates_flat[curr_idx : curr_idx + numel].view_as(
+                        param
                     )
-                    state["Q"] = Q_new
+                    param.add_(update_tensor, alpha=-lr)
+                    param.add_(param, alpha=-weight_decay * lr)  # Apply weight decay
+                    curr_idx += numel
 
             elif algo == "adamw":
                 for param in group["params"]:
