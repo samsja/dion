@@ -5,8 +5,11 @@ import time
 import torch
 import torch.distributed as dist
 import uuid
+import wandb
+import yaml
 
 from dataclasses import dataclass
+from pathlib import Path
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DeviceMesh
@@ -16,14 +19,10 @@ from typing import Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
-from opts.dion import Dion 
+from opts.dion import Dion
 from opts.dion_dist import Dion as Dion_Dist
 from opts.dion_dist import DionMixedPrecisionConfig
 from opts.muon import MuonMoonlight
- 
-
-import yaml
-from pathlib import Path
 
 
 @dataclass
@@ -66,9 +65,10 @@ class Hyperparameters:
     rank_fraction: float = 0.125
     oversample: float = 1.25
     qr_warmup: float = 0.05
-    
+
     power_iters: int = 1
-    approx_method: str = "qr"  # for DionOld and DionNorm optimizers 
+    approx_method: str = "qr"  # for DionOld and DionNorm optimizers
+
 
 # Helper function to only print on global rank 0
 MASTER_PROCESS = False
@@ -137,13 +137,13 @@ def override_args_from_cli(
 def main():
     # --- Command-line argument parsing ---
     parser = argparse.ArgumentParser(
-    description="Training script with input and output directories"
+        description="Training script with input and output directories"
     )
     parser.add_argument(
         "--config",
         type=str,
         help="Path to a YAML file whose keys match train.py flags "
-             "(CLI values always override the YAML).",
+        "(CLI values always override the YAML).",
     )
 
     parser.add_argument(
@@ -184,7 +184,7 @@ def main():
         type=int,
         default=None,
         help="Sparsity level for the optimizer",
-    ) 
+    )
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -282,37 +282,20 @@ def main():
     args = override_args_from_cli(args, cli_args)
     if cli_args.inv_rank_fraction:
         args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
-    
+
     if args.efficient == True:
         if MASTER_PROCESS:
             print("Using efficient Dion optimizer")
         if args.rank_fraction > 0.5:
             raise ValueError(
-                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup" \
+                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
                 "for rank_fraction=1 is under development"
             )
 
-
-    if MASTER_PROCESS and not cli_args.debug:
-        if cli_args.no_wandb:
-            from fake_wandb import FakeWandB
-
-            wandb_log = os.path.join(logdir, "wandb.log")
-            wandb = FakeWandB(wandb_log)
-        else:
-            import wandb
-
-            assert args.wandb_project_name, "wandb project name is required"
-
-        wandb.login(
-            key=os.environ.get("WANDB_API_KEY"),
-            host=os.environ.get("WANDB_HOST"),
-            timeout=0,
-        )
+    if MASTER_PROCESS and not cli_args.no_wandb:
+        assert args.wandb_project_name, "wandb project name is required"
         opt_name = f"{args.optimizer}+{args.scalar_opt}"
-        run_name = (
-            f"({opt_name})_bs={args.batch_size}_lr={args.lr}"
-        )
+        run_name = f"({opt_name})_bs={args.batch_size}_lr={args.lr}"
         if "dion" in args.optimizer:
             run_name += f"_sp={args.rank_fraction}"
             if args.efficient:
@@ -324,7 +307,15 @@ def main():
             )
         if cli_args.wandb_job_name:
             run_name += f"_{cli_args.wandb_job_name}"
-        wandb.init(project=args.wandb_project_name, name=run_name, config=args.__dict__)
+        if not cli_args.debug:
+            wandb.login(
+                key=os.environ.get("WANDB_API_KEY"),
+                host=os.environ.get("WANDB_HOST"),
+                timeout=0,
+            )
+            wandb.init(
+                project=args.wandb_project_name, name=run_name, config=args.__dict__
+            )
 
     # --- DataLoader Setup ---
     if cli_args.debug:
@@ -483,15 +474,15 @@ def main():
             approx_method=cli_args.approx_method,
             total_steps=args.num_iterations,
             qr_warmup=args.qr_warmup,
-            efficient=args.efficient
-        ) 
+            efficient=args.efficient,
+        )
     elif args.optimizer == "muon_moonlight":
         if args.scalar_opt == "adam":
             # separate optimizer will be used
             pass
         else:
             # hack to reuse scalar optimizer implementation inside Dion
-            #TBD: do we want to keep this or change
+            # TBD: do we want to keep this or change
             scalar_param_groups = []
             for group in param_groups:
                 if group["algorithm"] == args.scalar_opt:
@@ -580,7 +571,7 @@ def main():
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms"
             )
             print0(log_message)
-            if MASTER_PROCESS and not cli_args.debug:
+            if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
                 wandb.log(
                     {
                         "val/loss": val_loss,
@@ -628,7 +619,7 @@ def main():
 
         # Approximate updated training time just before logging
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        if MASTER_PROCESS and not cli_args.debug:
+        if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
             wandb.log(
                 {
                     "train/loss": train_loss.item(),
