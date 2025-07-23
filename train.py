@@ -19,10 +19,10 @@ from typing import Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
-from opts.dion import Dion
-from opts.muon import Muon
-from opts.dion_reference import Dion as DionReference
-from opts.muon_reference import MuonMoonlight as MuonReference
+from optimizers.dion import Dion
+from optimizers.muon import Muon
+from optimizers.dion_reference import Dion as DionReference
+from optimizers.muon_reference import MuonMoonlight as MuonReference
 
 
 @dataclass
