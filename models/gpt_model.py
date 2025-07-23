@@ -16,46 +16,11 @@ from typing import Optional
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024
-    # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    sequence_len: int = 1024
     vocab_size: int = 50304
     n_layer: int = 2
     n_head: int = 6
     n_embd: int = 768
-    dropout: float = 0.0
-    # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    bias: bool = False
-
-    eos_token_id: int = -1
-
-
-class LayerNorm(nn.Module):
-    """LayerNorm but with an optional bias. If bias=False, use RMSNorm."""
-
-    def __init__(
-        self,
-        ndim: int,
-        bias: bool,
-        eps: float = 1e-5,
-    ):
-        super().__init__()
-        self.eps = eps
-
-        if bias:
-            self.weight = nn.Parameter(torch.ones(ndim))
-            self.bias = nn.Parameter(torch.zeros(ndim))
-        else:
-            self.weight = nn.Parameter(torch.ones(ndim))
-            self.register_parameter("bias", None)
-
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self.bias is not None:
-            return F.layer_norm(
-                input, self.weight.shape, self.weight, self.bias, self.eps
-            )
-        else:
-            # just use RMSNorm
-            return F.rms_norm(input, self.weight.shape, self.weight, self.eps)
 
 
 class Rotary(torch.nn.Module):
@@ -244,13 +209,13 @@ class GPT(nn.Module):
     ) -> torch.LongTensor:
         """
         Repeatedly call self.forward(..., return_logits=True) to get next‑token logits,
-        then sample and append.  Keeps only the last `block_size` tokens as context.
+        then sample and append.  Keeps only the last `sequence_len` tokens as context.
         """
         idx = input_ids
         for _ in range(max_new_tokens):
             # crop context if too long
-            if idx.size(1) > self.config.block_size:
-                idx = idx[:, -self.config.block_size :]
+            if idx.size(1) > self.config.sequence_len:
+                idx = idx[:, -self.config.sequence_len :]
 
             # forward to get logits for every position
             logits = self(idx, targets=None, return_logits=True)
