@@ -9,6 +9,10 @@ from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from newton_schulz_triton import newton_schulz_triton
+from scalar_opts import (
+    lion_update_foreach_async,
+    adamw_update_foreach_async,
+)
 
 
 class Muon(Optimizer):
@@ -289,7 +293,7 @@ class Muon(Optimizer):
             weight_decay = torch.tensor(group["weight_decay"])
 
             yield AsyncTask(
-                lion_update_foreach(
+                lion_update_foreach_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
@@ -329,7 +333,7 @@ class Muon(Optimizer):
             step = torch.tensor(group["step"])
 
             yield AsyncTask(
-                adamw_update_foreach(
+                adamw_update_foreach_async(
                     X=to_local(params),
                     G=to_local(gradients),
                     M=to_local(momentums),
@@ -434,105 +438,6 @@ def create_param_batches(params: List[torch.Tensor], batch_size: int):
     for group in groups.values():
         for i in range(0, len(group), batch_size):
             yield group[i : i + batch_size]
-
-
-@torch.compile()
-def lion_update_foreach(
-    X: List[torch.Tensor],  # Model weights (modified in place)
-    G: List[torch.Tensor],  # Gradient
-    M: List[torch.Tensor],  # Momentum buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-) -> Generator[None, None, None]:
-    """
-    Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
-    """
-    assert len(X) == len(G)
-    assert len(X) == len(M)
-
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
-
-    # Compute sign update
-    # U = sign(beta1 * M + (1 - beta1) * G)
-    U = torch._foreach_lerp(M, G, 1 - beta1)
-    torch._foreach_sign_(U)
-
-    # Update momentum in place with new gradient
-    # M = beta2 * M + (1 - beta2) * G
-    torch._foreach_lerp_(M, G, 1 - beta2)
-
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - lr * U
-    torch._foreach_add_(X, U, alpha=-lr)
-
-    # Make this function a generator
-    yield
-
-
-@torch.compile()
-def adamw_update_foreach(
-    X: List[torch.Tensor],  # Model weights (modified in place)
-    G: List[torch.Tensor],  # Gradient
-    M: List[torch.Tensor],  # Momentum buffer (modified in place)
-    V: List[torch.Tensor],  # Variance buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
-) -> Generator[None, None, None]:
-    """
-    AdamW optimizer algorithm.
-    """
-    assert len(X) == len(G)
-    assert len(X) == len(M)
-    assert len(X) == len(V)
-
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
-
-    # Update momentum and variance
-    # M = beta1 * M + (1 - beta1) * G
-    torch._foreach_lerp_(M, G, 1 - beta1)
-    # V = beta2 * V + (1 - beta2) * G * G
-    torch._foreach_mul_(V, beta2)
-    torch._foreach_addcmul_(V, G, G, value=1 - beta2)
-
-    # Bias correction
-    bias_correction1 = 1 - beta1**step
-    bias_correction2 = 1 - beta2**step
-    bias_correction2_sqrt = bias_correction2.sqrt()
-
-    # The goal is to compute the following in-place:
-    # M = M / bias_correction1
-    # V = V / bias_correction2
-    # X = X - lr * M / (sqrt(V) + epsilon)
-
-    # Compute the denominator for the weight update
-    # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
-    denom = torch._foreach_sqrt(V)
-    torch._foreach_div_(denom, bias_correction2_sqrt)
-    torch._foreach_add_(denom, epsilon)
-
-    # Adjust learning rate to include bias correction 1
-    adj_lr = lr / bias_correction1
-
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - adj_lr * M / denom
-    torch._foreach_addcdiv_(X, M, denom, value=-adj_lr)
-
-    # Make this function a generator
-    yield
 
 
 def muon_update_one_batch(

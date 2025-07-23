@@ -9,6 +9,8 @@ from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple, Optional, Union
 
+from scalar_opts import adamw_update, lion_update
+
 try:
     from torch.distributed.tensor.placement_types import _StridedShard
 except ImportError:
@@ -342,34 +344,6 @@ class Dion(Optimizer):
                         beta1=beta1,
                         beta2=beta2,
                         weight_decay=weight_decay,
-                    )
-
-                # TODO maybe remove support for C-Lion if it's consistently worse than Lion
-                elif algo == "clion":
-                    if "vector_dim" not in group:
-                        raise ValueError(
-                            "Must specify vector_dim in param group for C-Lion."
-                        )
-                    vector_dim = group["vector_dim"]
-
-                    if not state:
-                        self._init_opt_state_momentum(param, state)
-
-                    X = param
-                    G = param.grad
-                    M = state["momentum"]
-
-                    # Sharded DTensor params can be updated element-wise
-                    clion_update(
-                        X=X.to_local() if isinstance(X, DTensor) else X,
-                        G=G.to_local() if isinstance(G, DTensor) else G,
-                        M=M.to_local() if isinstance(M, DTensor) else M,
-                        lr=lr,
-                        beta1=beta1,
-                        beta2=beta2,
-                        weight_decay=weight_decay,
-                        vector_dim=vector_dim,
-                        epsilon=self._epsilon,
                     )
 
                 else:
@@ -1004,141 +978,3 @@ def generate_random_sketch_dtensor(
     S *= std
 
     return S
-
-
-@torch.compile(dynamic=True)
-def adamw_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    G: torch.Tensor,  # Gradient (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    V: torch.Tensor,  # Variance buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
-):
-    """
-    AdamW optimizer algorithm.
-    """
-    assert X.shape == G.shape
-    assert X.shape == M.shape
-
-    # Update momentum and variance
-    # M = beta1 * M + (1 - beta1) * G
-    M.lerp_(G.to(M.dtype), 1 - beta1)
-    # V = beta2 * V + (1 - beta2) * G * G
-    V.mul_(beta2).addcmul_(G, G, value=1 - beta2)
-
-    # Bias correction
-    bias_correction1 = 1 - beta1**step
-    bias_correction2 = 1 - beta2**step
-    bias_correction2_sqrt = bias_correction2.sqrt()
-
-    # The goal is to compute the following in-place:
-    # M = M / bias_correction1
-    # V = V / bias_correction2
-    # X = X - lr * M / (sqrt(V) + epsilon)
-
-    # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
-    denom = V.sqrt().div_(bias_correction2_sqrt).add_(epsilon)
-
-    # Adjust learning rate to include bias correction 1
-    adj_lr = lr / bias_correction1
-
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - adj_lr * M / denom
-    X.addcdiv_(M, denom, value=-adj_lr)
-
-
-@torch.compile(dynamic=True)
-def clion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    G: torch.Tensor,  # Gradient (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-    vector_dim: Optional[int],  # Dimension to normalize vectors
-    epsilon: float,
-):
-    """
-    C-Lion optimizer algorithm based on paper: https://arxiv.org/pdf/2411.16085
-    Modified version to maintain constant RMS norm for weight update.
-
-    The RMS norm is calculated over vector_dim. Setting to -1 (last dim)
-    should work for both 1D bias vectors and 2D embedding matrices.
-    If vector_dim is None, the entire tensor is used for normalization.
-    """
-    assert X.shape == G.shape
-    assert X.shape == M.shape
-
-    G = G.to(M.dtype)
-
-    # Compute sign update
-    # U = sign(beta1 * M + (1 - beta1) * G)
-    U = M.lerp(G, 1 - beta1).sign_()
-
-    # Update momentum with new gradient
-    # M = beta2 * M + (1 - beta2) * G
-    M.lerp_(G, 1 - beta2)
-
-    # Compute boolean mask where update and gradient have the same sign
-    # G will be no longer needed, so we can modify in place
-    # mask = sign(G) * U >= 0
-    mask = G.sign_().mul_(U).greater_equal_(0)
-
-    # Adjust by sqrt to maintain the same RMS norm
-    if vector_dim is None:
-        vec_len = mask.numel()
-        vec_sum = mask.sum()
-    else:
-        vec_len = mask.size(vector_dim)
-        vec_sum = mask.sum(dim=vector_dim, keepdim=True)
-    adj_lr = lr * (vec_len / (vec_sum + epsilon)).sqrt()
-
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - adj_lr * mask * U
-    X.addcmul_(U, mask, value=-adj_lr)
-
-
-@torch.compile(dynamic=True)
-def lion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    G: torch.Tensor,  # Gradient (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-):
-    """
-    Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
-    """
-    assert X.shape == G.shape
-    assert X.shape == M.shape
-
-    G = G.to(M.dtype)
-
-    # Compute sign update
-    # U = sign(beta1 * M + (1 - beta1) * G)
-    U = M.lerp(G, 1 - beta1).sign_()
-
-    # Update momentum with new gradient
-    # M = beta2 * M + (1 - beta2) * G
-    M.lerp_(G, 1 - beta2)
-
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Weight update
-    # X = X - lr * U
-    X.add_(U, alpha=-lr)

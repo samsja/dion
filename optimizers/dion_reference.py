@@ -4,6 +4,8 @@ import torch
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple
 
+from scalar_opts import adamw_update, lion_update
+
 
 def extract_PQ(
     u: torch.Tensor,  # shape (n, m)
@@ -143,79 +145,6 @@ def dion_update(
     scale = (fan_out / fan_in) ** 0.5
 
     return scale * P @ Q.T  # Return the update direction
-
-
-@torch.compile(dynamic=True)
-def adamw_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    V: torch.Tensor,  # Variance buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
-):
-    """
-    AdamW optimizer algorithm.
-    """
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Update momentum and variance
-    # M = beta1 * M + (1 - beta1) * X.grad
-    M.lerp_(X.grad, 1 - beta1)
-    # V = beta2 * V + (1 - beta2) * X.grad * X.grad
-    V.mul_(beta2).addcmul_(X.grad, X.grad, value=1 - beta2)
-
-    # Bias correction
-    bias_correction1 = 1 - beta1**step
-    bias_correction2 = 1 - beta2**step
-    bias_correction2_sqrt = bias_correction2.sqrt()
-
-    # The goal is to compute the following in-place:
-    # M = M / bias_correction1
-    # V = V / bias_correction2
-    # X = X - lr * M / (sqrt(V) + epsilon)
-
-    # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
-    denom = V.sqrt().div_(bias_correction2_sqrt).add_(epsilon)
-
-    # Adjust learning rate to include bias correction 1
-    adj_lr = lr / bias_correction1
-
-    # Weight update
-    # X = X - adj_lr * M / denom
-    X.addcdiv_(M, denom, value=-adj_lr)
-
-
-@torch.compile(dynamic=True)
-def lion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    beta1: torch.Tensor,  # Beta 1 (scalar tensor)
-    beta2: torch.Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-):
-    """
-    Lion optimizer algorithm. Sign update should guarantee RMS norm equal to 1.
-    """
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Compute sign update
-    # U = sign(beta1 * M + (1 - beta1) * X.grad)
-    U = M.lerp(X.grad, 1 - beta1).sign_()
-
-    # Update momentum with new gradient
-    # M = beta2 * M + (1 - beta2) * X.grad
-    M.lerp_(X.grad, 1 - beta2)
-
-    # Weight update
-    # X = X - lr * U
-    X.add_(U, alpha=-lr)
 
 
 class Dion(Optimizer):
@@ -385,6 +314,7 @@ class Dion(Optimizer):
                     # Apply update
                     adamw_update(
                         X=param,
+                        G=param.grad,
                         M=state["momentum"],
                         V=state["variance"],
                         lr=lr,
@@ -408,6 +338,7 @@ class Dion(Optimizer):
                     # Apply update
                     lion_update(
                         X=param,
+                        G=param.grad,
                         M=state["momentum"],
                         lr=lr,
                         beta1=beta1,
