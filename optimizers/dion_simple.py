@@ -1,6 +1,5 @@
-import math
-import os
 import torch
+from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from torch.distributed.tensor import DTensor
 from typing import Any, Dict, Tuple
@@ -8,14 +7,16 @@ from typing import Any, Dict, Tuple
 from .scalar_opts import adamw_update, lion_update
 
 
-@torch.compile(dynamic=True)
+@torch.compile()
 def dion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    Q: torch.Tensor,  # Q matrix for power iteration
-    mu: torch.Tensor,  # Momentum factor (scalar tensor)
-    epsilon: float,
-) -> torch.Tensor:
+    X: Tensor,  # Model weights (modified in place)
+    M: Tensor,  # Momentum buffer (modified in place)
+    Q: Tensor,  # Q matrix for power iteration (modified in place)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    mu: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: float = 1e-8,
+):
     """
     Dion optimizer algorithm.
     """
@@ -32,14 +33,19 @@ def dion_update(
     M.addmm_(P, R.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
-    Q.copy_(R / (R.norm(dim=0, keepdim=True) + epsilon))
+    Q_new = R / (R.norm(dim=0, keepdim=True) + epsilon)
+    Q.copy_(Q_new)
 
-    # Compute update scale factor
+    # Compute update scale factor based on matrix shape
     fan_out = X.size(0)
     fan_in = X.size(1)
-    scale = (fan_out / fan_in) ** 0.5
+    scaled_lr = lr * ((fan_out / fan_in) ** 0.5)
 
-    return scale * P @ Q.T  # Return the update direction
+    # Apply weight decay
+    X.mul_(1 - weight_decay * lr)
+
+    # Apply the weight update
+    X.addmm_(P, Q.T, alpha=-scaled_lr)
 
 
 class Dion(Optimizer):
@@ -50,7 +56,7 @@ class Dion(Optimizer):
         mu: float = 0.95,  # For Dion
         betas: Tuple[float, float] = (0.9, 0.95),  # For AdamW and Lion
         weight_decay: float = 0.01,
-        rank: int = 8,
+        rank: int = 768,
         epsilon: float = 1e-8,
     ):
         if lr < 0.0:
@@ -61,7 +67,7 @@ class Dion(Optimizer):
             raise ValueError(f"Invalid betas: {betas}")
         if weight_decay < 0.0:
             raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if rank <= 0:
+        if rank < 1:
             raise ValueError(f"Invalid rank value: {rank}")
 
         defaults = dict(
@@ -116,9 +122,7 @@ class Dion(Optimizer):
             weight_decay = torch.tensor(group["weight_decay"])
 
             if algo == "dion":
-
                 for param in group["params"]:
-
                     assert not isinstance(
                         param, DTensor
                     ), "DionSimple does not support distributed tensors."
@@ -132,7 +136,7 @@ class Dion(Optimizer):
                         self._init_opt_state_dion(param, state)
 
                     # Apply update
-                    update = dion_update(
+                    dion_update(
                         X=param,
                         M=state["momentum"],
                         Q=state["Q"],
@@ -140,9 +144,6 @@ class Dion(Optimizer):
                         mu=mu,
                         epsilon=self.epsilon,
                     )
-
-                    param.add_(update, alpha=-lr)
-                    param.add_(param, alpha=-weight_decay * lr)
 
             elif algo == "adamw":
                 for param in group["params"]:
@@ -194,7 +195,7 @@ class Dion(Optimizer):
 
         return loss
 
-    def _init_opt_state_dion(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_dion(self, param: Tensor, state: Dict[str, Any]):
         # Initialize momentum and Q for a 2D matrix parameter
         state["momentum"] = torch.zeros_like(param)
         r = min(self.rank, min(param.shape))
@@ -202,9 +203,9 @@ class Dion(Optimizer):
             (param.size(1), r), device=param.device, dtype=param.dtype
         )
 
-    def _init_opt_state_adam(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_adam(self, param: Tensor, state: Dict[str, Any]):
         state["momentum"] = torch.zeros_like(param)
         state["variance"] = torch.zeros_like(param)
 
-    def _init_opt_state_lion(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_lion(self, param: Tensor, state: Dict[str, Any]):
         state["momentum"] = torch.zeros_like(param)
