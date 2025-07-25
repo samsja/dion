@@ -2,10 +2,10 @@ import math
 import os
 import torch
 from torch.optim.optimizer import Optimizer, ParamsT
+from torch.distributed.tensor import DTensor
 from typing import Any, Dict, Tuple
 
 from .scalar_opts import adamw_update, lion_update
-
 
 
 @torch.compile(dynamic=True)
@@ -25,7 +25,7 @@ def dion_update(
     # Compute low-rank approximation of M = P @ Q^T
     P = M @ Q
     P, _ = torch.linalg.qr(P)
-    R = M.T @ P  
+    R = M.T @ P
 
     # Error feedback
     # M = M - (1 - mu) * (P @ R.T)
@@ -103,7 +103,6 @@ class Dion(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-
         for group in self.param_groups:
             algo = group["algorithm"]
             group["step"] += 1
@@ -119,7 +118,11 @@ class Dion(Optimizer):
             if algo == "dion":
 
                 for param in group["params"]:
-                   
+
+                    assert not isinstance(
+                        param, DTensor
+                    ), "DionSimple does not support distributed tensors."
+
                     if param.grad is None:
                         raise ValueError("Gradient is None.")
 
@@ -140,7 +143,6 @@ class Dion(Optimizer):
 
                     param.add_(update, alpha=-lr)
                     param.add_(param, alpha=-weight_decay * lr)
-
 
             elif algo == "adamw":
                 for param in group["params"]:

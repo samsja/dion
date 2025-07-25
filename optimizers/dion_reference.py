@@ -2,6 +2,7 @@ import math
 import os
 import torch
 from torch.optim.optimizer import Optimizer, ParamsT
+from torch.distributed.tensor import DTensor
 from typing import Any, Dict, Tuple
 
 from .scalar_opts import adamw_update, lion_update
@@ -250,6 +251,11 @@ class Dion(Optimizer):
                 curr_idx = 0
 
                 for i, param in enumerate(group["params"]):
+
+                    assert not isinstance(
+                        param, DTensor
+                    ), "DionSimple does not support distributed tensors."
+
                     numel = param.numel()
                     # Only the owner rank (defined by modulo over param index) computes the update.
                     if i % world_size == rank:
