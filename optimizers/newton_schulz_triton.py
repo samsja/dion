@@ -1,6 +1,7 @@
 import torch
 import triton
 import triton.language as tl
+from torch import Tensor
 
 
 def _get_autotune_configs():
@@ -130,7 +131,7 @@ def ns_line_1_kernel(
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
 
-def ns_line_1(A: torch.Tensor, *, out: torch.Tensor = None):
+def ns_line_1(A: Tensor, *, out: Tensor = None):
     """
     Launch Triton kernel to compute C = A @ A.T
     """
@@ -257,7 +258,7 @@ def ns_line_2_kernel(
     tl.store(c_ptrs_t, output.T, mask=c_mask_t)
 
 
-def ns_line_2(A: torch.Tensor, alpha: float, beta: float, *, out: torch.Tensor = None):
+def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
     """
     Launch Triton kernel to compute C = alpha * A @ A.T + beta * A
     """
@@ -302,7 +303,7 @@ def ns_line_2(A: torch.Tensor, alpha: float, beta: float, *, out: torch.Tensor =
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-def zeropower_via_newtonschulz5(G: torch.Tensor, epsilon: float = 1e-7):
+def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     """
     Reference implementation of Newton-Schulz without Triton.
     """
@@ -333,7 +334,7 @@ def zeropower_via_newtonschulz5(G: torch.Tensor, epsilon: float = 1e-7):
 
 
 @torch.compile(dynamic=False, fullgraph=True)
-def newton_schulz_triton(G: torch.Tensor, epsilon: float = 1e-7):
+def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
     Triton implementation of Newton-Schulz iteration
     """

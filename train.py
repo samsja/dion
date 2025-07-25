@@ -485,7 +485,7 @@ def main():
             efficient=args.efficient,
         )
     elif args.optimizer == "dion_simple":
-        assert(
+        assert (
             device_mesh is None
         ), "Simplified version of Dion does not support device mesh"
         opt = DionReference(

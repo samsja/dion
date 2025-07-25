@@ -1,14 +1,20 @@
 import math
 import torch
 import torch.distributed as dist
-from collections import defaultdict
 from itertools import chain
+from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
 from .newton_schulz_triton import newton_schulz_triton
+from .opt_utils import (
+    AsyncTask,
+    AsyncRuntime,
+    to_local,
+    create_param_batches,
+)
 from .scalar_opts import (
     lion_update_foreach_async,
     adamw_update_foreach_async,
@@ -160,23 +166,13 @@ class Muon(Optimizer):
 
         return loss
 
-    def _get_or_initialize_state(self, param: torch.Tensor, algo: str) -> dict:
+    def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
             if algo == "adamw":
                 state["variance"] = torch.zeros_like(param)
         return state
-
-    def _pad_to_world_size(self, tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        Insert dummy tensors to ensure that each batch has exactly `batch_size` elements.
-        """
-        assert len(tensors) > 0
-        assert len(tensors) <= self._world_size
-        while len(tensors) < self._world_size:
-            tensors.append(torch.empty_like(tensors[0]))
-        return tensors
 
     def _create_muon_tasks(
         self,
@@ -208,7 +204,7 @@ class Muon(Optimizer):
 
             # Create batches of parameters of size self._world_size
             for params in create_param_batches(
-                group_params, batch_size=self._world_size
+                group_params, batch_size=self._world_size, pad=True
             ):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
@@ -248,10 +244,10 @@ class Muon(Optimizer):
                             )
 
                 yield AsyncTask(
-                    muon_update_one_batch(
-                        X=self._pad_to_world_size(params),
-                        G=self._pad_to_world_size(gradients),
-                        M=self._pad_to_world_size(momentums),
+                    muon_update_batch_async(
+                        X=params,
+                        G=gradients,
+                        M=momentums,
                         lr=lr,
                         momentum=mu,
                         weight_decay=weight_decay,
@@ -348,106 +344,14 @@ class Muon(Optimizer):
             )
 
 
-class AsyncTask:
-    """
-    AsyncTask wraps a Python generator to run until the next yield statement.
-    This is used to allow other tasks to run while waiting for distributed operations.
-    """
-
-    def __init__(self, generator: Generator[None, None, None]):
-        self._generator = generator
-        next(self._generator)  # Start running the generator
-
-    def run(self) -> bool:
-        # Run the next step of the async task.
-        # Returns True if the task is still running and False if completed.
-        try:
-            next(self._generator)
-            return True
-        except StopIteration:
-            pass
-        return False
-
-
-class AsyncRuntime:
-    """
-    Event loop for running multiple async tasks concurrently.
-    """
-
-    def __init__(
-        self, task_gen: Generator["AsyncTask", None, None], max_concurrent_tasks: int
-    ):
-        # Initialize runtime with a generator that produces AsyncTask objects
-        if max_concurrent_tasks <= 0:
-            raise ValueError(f"{max_concurrent_tasks=} cannot be <= 0")
-        self._task_gen = task_gen
-        self._max_concurrent_tasks = max_concurrent_tasks
-
-    def _get_next_task(self) -> Optional["AsyncTask"]:
-        try:
-            task = next(self._task_gen)
-            return task
-        except StopIteration:
-            return None
-
-    def run(self):
-        # Run the event loop until all tasks are completed
-        have_new_tasks = True
-        previous_tasks = []
-
-        while have_new_tasks or previous_tasks:
-            # See if we can add another task
-            running_tasks = []
-            if have_new_tasks and len(previous_tasks) < self._max_concurrent_tasks:
-                new_task = self._get_next_task()
-                if new_task is not None:
-                    # Add new task to the queue
-                    running_tasks.append(new_task)
-                else:
-                    # No more tasks left
-                    have_new_tasks = False
-
-            # Run all previous tasks for one step
-            for task in previous_tasks:
-                still_running = task.run()
-                if still_running:
-                    running_tasks.append(task)
-
-            # Update task list for next iteration
-            previous_tasks = running_tasks
-
-
-def to_local(tensors: List[torch.Tensor]) -> List[torch.Tensor]:
-    """
-    Convert a list of DTensors to local tensors.
-    This is a no-op for a list of regular tensors.
-    """
-    return [t.to_local() if isinstance(t, DTensor) else t for t in tensors]
-
-
-def create_param_batches(params: List[torch.Tensor], batch_size: int):
-    """
-    Batch parameters into groups of size `batch_size`.
-    Tensors in each batch will have identical shape, sharding, and dtype.
-    """
-    groups = defaultdict(list)
-    for p in params:
-        sharding = p.placements if isinstance(p, DTensor) else None
-        groups[(p.shape, sharding, p.dtype)].append(p)
-
-    for group in groups.values():
-        for i in range(0, len(group), batch_size):
-            yield group[i : i + batch_size]
-
-
-def muon_update_one_batch(
-    X: List[torch.Tensor],  # Model weights (modified in place)
-    G: List[torch.Tensor],  # Gradient
-    M: List[torch.Tensor],  # Momentum buffer (modified in place)
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    momentum: torch.Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
-    epsilon: torch.Tensor,  # Epsilon (scalar tensor)
+def muon_update_batch_async(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    momentum: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: Tensor,  # Epsilon (scalar tensor)
     nesterov: bool,  # Whether to use Nesterov momentum
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
     adjust_lr: Optional[str],  # How to adjust learning rate
@@ -566,11 +470,11 @@ def muon_update_one_batch(
 
 @torch.compile()
 def muon_update_pre_orthogonalize(
-    G: List[torch.Tensor],
-    M: List[torch.Tensor],
-    momentum: torch.Tensor,
+    G: List[Tensor],
+    M: List[Tensor],
+    momentum: Tensor,
     nesterov: bool,
-) -> List[torch.Tensor]:
+) -> List[Tensor]:
     """
     Update momentum with gradient and compute the input to orthogonalization.
     Inputs and outputs should be lists of regular Tensor, not DTensor.
@@ -596,11 +500,11 @@ def muon_update_pre_orthogonalize(
 
 @torch.compile()
 def muon_update_post_orthogonalize(
-    X: List[torch.Tensor],
-    U: List[torch.Tensor],
-    base_lr: torch.Tensor,
-    adjusted_lr: torch.Tensor,
-    weight_decay: torch.Tensor,
+    X: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,
+    adjusted_lr: Tensor,
+    weight_decay: Tensor,
 ):
     """
     Apply weight decay and weight update after orthogonalization.
@@ -615,11 +519,11 @@ def muon_update_post_orthogonalize(
 
 
 def muon_update_newton_schulz(
-    X: torch.Tensor,
+    X: Tensor,
     newton_schulz_func: Callable,
     flatten: bool,
-    epsilon: float,
-) -> torch.Tensor:
+    epsilon: Tensor,
+) -> Tensor:
     """
     Flatten the input tensor if needed and call the Newton-Schulz function.
     """
@@ -652,7 +556,7 @@ def adjust_lr_spectral_norm(lr, param_shape):
 
 
 @torch.compile()
-def zeropower_via_newtonschulz5(G: torch.Tensor, epsilon: float = 1e-7):
+def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     """
     Newton-Schulz iteration to approximate the orthogonalization of X.
     """

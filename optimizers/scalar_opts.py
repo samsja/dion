@@ -6,7 +6,7 @@ from typing import List, Generator
 @torch.compile()
 def adamw_update(
     X: Tensor,  # Model weights (modified in place)
-    G: Tensor,  # Gradient (modified in place)
+    G: Tensor,  # Gradient
     M: Tensor,  # Momentum buffer (modified in place)
     V: Tensor,  # Variance buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
@@ -55,7 +55,7 @@ def adamw_update(
 @torch.compile()
 def lion_update(
     X: Tensor,  # Model weights (modified in place)
-    G: Tensor,  # Gradient (modified in place)
+    G: Tensor,  # Gradient
     M: Tensor,  # Momentum buffer (modified in place)
     lr: Tensor,  # Learning rate (scalar tensor)
     beta1: Tensor,  # Beta 1 (scalar tensor)

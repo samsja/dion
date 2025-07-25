@@ -3,12 +3,14 @@ import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from dataclasses import dataclass
+from torch import Tensor
 from torch.distributed import ProcessGroup, ReduceOp
 from torch.distributed.tensor import DeviceMesh, DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple, Optional, Union
 
+from .opt_utils import to_local
 from .scalar_opts import adamw_update, lion_update
 
 try:
@@ -174,7 +176,7 @@ class Dion(Optimizer):
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
-        self._dion_state: Dict[torch.Tensor, DionParamState] = {}
+        self._dion_state: Dict[Tensor, DionParamState] = {}
 
         self._replicate_mesh = replicate_mesh
         self._outer_shard_mesh = outer_shard_mesh
@@ -261,6 +263,7 @@ class Dion(Optimizer):
                             )
                         Q_new = dion_update_dtensor(
                             X=param,
+                            G=param.grad,
                             M=state["momentum"],
                             Q=Q,
                             lr=lr,
@@ -289,6 +292,7 @@ class Dion(Optimizer):
                             self._rng.manual_seed(0)
                         Q_new = dion_update(
                             X=param,
+                            G=param.grad,
                             M=state["momentum"],
                             Q=Q,
                             lr=lr,
@@ -308,17 +312,12 @@ class Dion(Optimizer):
                     if not state:
                         self._init_opt_state_adam(param, state)
 
-                    X = param
-                    G = param.grad
-                    M = state["momentum"]
-                    V = state["variance"]
-
                     # Sharded DTensor params can be updated element-wise
                     adamw_update(
-                        X=X.to_local() if isinstance(X, DTensor) else X,
-                        G=G.to_local() if isinstance(G, DTensor) else G,
-                        M=M.to_local() if isinstance(M, DTensor) else M,
-                        V=V.to_local() if isinstance(V, DTensor) else V,
+                        X=to_local(param),
+                        G=to_local(param.grad),
+                        M=to_local(state["momentum"]),
+                        V=to_local(state["variance"]),
                         lr=lr,
                         beta1=beta1,
                         beta2=beta2,
@@ -331,15 +330,11 @@ class Dion(Optimizer):
                     if not state:
                         self._init_opt_state_momentum(param, state)
 
-                    X = param
-                    G = param.grad
-                    M = state["momentum"]
-
                     # Sharded DTensor params can be updated element-wise
                     lion_update(
-                        X=X.to_local() if isinstance(X, DTensor) else X,
-                        G=G.to_local() if isinstance(G, DTensor) else G,
-                        M=M.to_local() if isinstance(M, DTensor) else M,
+                        X=to_local(param),
+                        G=to_local(param.grad),
+                        M=to_local(state["momentum"]),
                         lr=lr,
                         beta1=beta1,
                         beta2=beta2,
@@ -351,7 +346,7 @@ class Dion(Optimizer):
 
         return loss
 
-    def _all_reduce_gradient(self, tensor: torch.Tensor):
+    def _all_reduce_gradient(self, tensor: Tensor):
         """
         All-reduce the gradient of a tensor over the replicated data-parallel world.
         """
@@ -372,7 +367,7 @@ class Dion(Optimizer):
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
             )
 
-    def _get_dion_state(self, x: torch.Tensor) -> DionParamState:
+    def _get_dion_state(self, x: Tensor) -> DionParamState:
         """
         Get the Dion-specific parameter state info for a given tensor.
         If the state is not already initialized, it will be created.
@@ -483,14 +478,14 @@ class Dion(Optimizer):
         self._dion_state[x] = state
         return state
 
-    def _init_opt_state_momentum(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_momentum(self, param: Tensor, state: Dict[str, Any]):
         # Create the momentum buffer
         # If param is DTensor, this will also be a DTensor
         state["momentum"] = torch.zeros_like(
             param, dtype=self._mixed_precision_config.momentum_dtype
         )
 
-    def _init_opt_state_adam(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_adam(self, param: Tensor, state: Dict[str, Any]):
         self._init_opt_state_momentum(param, state)
         state["variance"] = torch.zeros_like(
             param, dtype=self._mixed_precision_config.variance_dtype
@@ -498,7 +493,7 @@ class Dion(Optimizer):
 
     def _init_opt_state_dion(
         self,
-        param: torch.Tensor,
+        param: Tensor,
         state: Dict[str, Any],
         rank_fraction: float,
         rank_multiple_of: int,
@@ -567,7 +562,7 @@ class Dion(Optimizer):
 
         state["Q"] = Q
 
-    def _replicate_mesh_broadcast(self, tensor: torch.Tensor):
+    def _replicate_mesh_broadcast(self, tensor: Tensor):
         """
         Broadcast a tensor from rank 0 over the replicated data-parallel world.
         Tensor is modified in place.
@@ -588,19 +583,20 @@ class Dion(Optimizer):
 
 @torch.compile(dynamic=True)
 def dion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    Q: torch.Tensor,  # Q matrix for power iteration
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    mu: torch.Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+    X: Tensor,  # Model weights (modified in place)
+    G: Tensor,  # Gradient
+    M: Tensor,  # Momentum buffer (modified in place)
+    Q: Tensor,  # Q matrix for power iteration
+    lr: Tensor,  # Learning rate (scalar tensor)
+    mu: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: float,
     transpose: bool,
     power_iters: int,
     oversample: float = 1.25,
     all_reduce_PQ: bool = True,
     rng: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+) -> Tensor:
     """
     Dion optimizer algorithm (non-distributed version)
     """
@@ -611,7 +607,7 @@ def dion_update(
     Q = Q.to(M.dtype)
 
     # Add new gradient to momentum
-    M.add_(X.grad)
+    M.add_(G)
 
     # Compute low-rank approximation of M = P @ Q^T
     # M, Q, P, R should all have the same dtype
@@ -655,13 +651,13 @@ def dion_update(
 
 
 def power_iteration(
-    B: torch.Tensor,
-    Q_init: torch.Tensor,
+    B: Tensor,
+    Q_init: Tensor,
     power_iters: int,
     oversample: float,
     all_reduce_PQ: bool,
     rng: torch.Generator,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """
     Returns a low-rank approximation of B by power iteration.
     Compute P and Q such that (approximately) B = P @ Q^T.
@@ -684,10 +680,10 @@ def power_iteration(
 
 
 def orthogonalize(
-    P: torch.Tensor,
+    P: Tensor,
     oversample: float = 1.25,
     rng: Optional[torch.Generator] = None,
-) -> torch.Tensor:
+) -> Tensor:
     """
     Orthogonalize a matrix P using Randomized Cholesky QR.
     """
@@ -727,8 +723,8 @@ def orthogonalize(
 
 
 def fix_all_zero_or_nan(
-    P: torch.Tensor, Q: torch.Tensor, Q_init: torch.Tensor, B: torch.Tensor
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    P: Tensor, Q: Tensor, Q_init: Tensor, B: Tensor
+) -> Tuple[Tensor, Tensor]:
     """
     If input is all zero, P and Q will be nan or all zero.
     We want to return the conditional expressions:
@@ -743,7 +739,7 @@ def fix_all_zero_or_nan(
     Here this is implemented without data-dependent control flow.
     To avoid additional communication, we handle sharded tensors independently.
     """
-    B_local = B.to_local() if isinstance(B, DTensor) else B
+    B_local = to_local(B)
     is_all_zero = (B_local == 0).all()
     not_all_zero = ~is_all_zero
     P = P.nan_to_num() * not_all_zero
@@ -755,11 +751,12 @@ def fix_all_zero_or_nan(
 # TODO check for alternative to addmm_(), which does not work for DTensor
 def dion_update_dtensor(
     X: DTensor,  # Model weights (modified in place)
+    G: DTensor,  # Gradient
     M: DTensor,  # Momentum buffer (modified in place)
     Q: DTensor,  # Q matrix for power iteration
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    mu: torch.Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    mu: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: float,
     transpose: bool,
     power_iters: int,
@@ -777,7 +774,7 @@ def dion_update_dtensor(
     Q = Q.to(M.dtype)
 
     # Add new gradient to momentum
-    M.add_(X.grad)
+    M.add_(G)
 
     # Compute low-rank approximation of M = P @ Q^T
     # M, Q, P, R should all have the same dtype
@@ -863,12 +860,11 @@ def mesh_all_reduce_dtensor(
 
     # All-reduce local shard over each specified dimension
     tensor_local = tensor.to_local()
-    for dim in range(reduce_mesh.ndim):
-        tensor_local = funcol.all_reduce(
-            tensor_local,
-            reduceOp=reduce_op,
-            group=(reduce_mesh, dim),
-        )
+    tensor_local = funcol.all_reduce(
+        tensor_local,
+        reduceOp=reduce_op,
+        group=reduce_mesh,
+    )
 
     # Convert back to DTensor
     tensor = DTensor.from_local(

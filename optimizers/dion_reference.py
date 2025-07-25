@@ -1,6 +1,7 @@
 import math
 import os
 import torch
+from torch import Tensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from torch.distributed.tensor import DTensor
 from typing import Any, Dict, Tuple
@@ -9,12 +10,12 @@ from .scalar_opts import adamw_update, lion_update
 
 
 def extract_PQ(
-    u: torch.Tensor,  # shape (n, m)
-    Q_init: torch.Tensor,  # shape (m, rank)
+    u: Tensor,  # shape (n, m)
+    Q_init: Tensor,  # shape (m, rank)
     method: str,  # "svd", "qr", "cqr", "rcqr"
     fallback_method: str,  # "svd", "qr", "cqr", "rcqr"
     power_iters: int = 1,  # ignored for SVD method
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """
     Returns a rank-`rank` low-rank approximation of `u` by extracting
     P and Q such that (approximately) u ≈ P @ Q^T.
@@ -55,11 +56,11 @@ def extract_PQ(
 
 
 def orthogonalize(
-    P: torch.Tensor,
+    P: Tensor,
     method: str,
     fallback_method: str,  # only used for method "cqr"
     oversample: float = 1.25,  # only used for method "rcqr"
-) -> torch.Tensor:
+) -> Tensor:
     """
     Orthogonalize the input matrix using the specified method.
         - "qr": Householder QR (torch.linalg.qr)
@@ -107,17 +108,17 @@ def orthogonalize(
 
 @torch.compile(dynamic=True)
 def dion_update(
-    X: torch.Tensor,  # Model weights (modified in place)
-    M: torch.Tensor,  # Momentum buffer (modified in place)
-    Q: torch.Tensor,  # Q matrix for power iteration
-    lr: torch.Tensor,  # Learning rate (scalar tensor)
-    mu: torch.Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: torch.Tensor,  # Weight decay (scalar tensor)
+    X: Tensor,  # Model weights (modified in place)
+    M: Tensor,  # Momentum buffer (modified in place)
+    Q: Tensor,  # Q matrix for power iteration
+    lr: Tensor,  # Learning rate (scalar tensor)
+    mu: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
     approx_method: str,  # Approximation method for low-rank factorization
     fallback_approx_method: str,  # Fallback approximation method if CQR fails for efficient Dion
     power_iters: int,  # Number of power iterations
     epsilon: float,
-) -> torch.Tensor:
+) -> Tensor:
     """
     Dion optimizer algorithm.
     """
@@ -359,7 +360,7 @@ class Dion(Optimizer):
 
         return loss
 
-    def _init_opt_state_dion(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_dion(self, param: Tensor, state: Dict[str, Any]):
         # Initialize momentum and Q for a 2D matrix parameter
         state["momentum"] = torch.zeros_like(param)
         r = min(self.rank, min(param.shape))
@@ -367,9 +368,9 @@ class Dion(Optimizer):
             (param.size(1), r), device=param.device, dtype=param.dtype
         )
 
-    def _init_opt_state_adam(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_adam(self, param: Tensor, state: Dict[str, Any]):
         state["momentum"] = torch.zeros_like(param)
         state["variance"] = torch.zeros_like(param)
 
-    def _init_opt_state_lion(self, param: torch.Tensor, state: Dict[str, Any]):
+    def _init_opt_state_lion(self, param: Tensor, state: Dict[str, Any]):
         state["momentum"] = torch.zeros_like(param)
