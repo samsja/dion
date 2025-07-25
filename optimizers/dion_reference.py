@@ -4,7 +4,7 @@ import torch
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple
 
-from scalar_opts import adamw_update, lion_update
+from .scalar_opts import adamw_update, lion_update
 
 
 def extract_PQ(
@@ -204,6 +204,8 @@ class Dion(Optimizer):
             f"  - Power iterations: {power_iters}\n"
             f"  - Epsilon: {epsilon}\n"
             f"  - Rank-r approximation method: {approx_method}\n"
+            f"  - QR warmup steps: {qr_warmup_steps}\n"
+            f"  - Efficient mode: {efficient}\n"
         )
 
         # Check that all Dion parameters are 2D tensors

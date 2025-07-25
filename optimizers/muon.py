@@ -8,8 +8,8 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Generator, List, Optional, Tuple, Union
 
-from newton_schulz_triton import newton_schulz_triton
-from scalar_opts import (
+from .newton_schulz_triton import newton_schulz_triton
+from .scalar_opts import (
     lion_update_foreach_async,
     adamw_update_foreach_async,
 )

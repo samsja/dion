@@ -9,7 +9,7 @@ from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Any, Dict, Tuple, Optional, Union
 
-from scalar_opts import adamw_update, lion_update
+from .scalar_opts import adamw_update, lion_update
 
 try:
     from torch.distributed.tensor.placement_types import _StridedShard

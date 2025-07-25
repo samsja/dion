@@ -23,6 +23,7 @@ from optimizers.dion import Dion
 from optimizers.muon import Muon
 from optimizers.dion_reference import Dion as DionReference
 from optimizers.muon_reference import MuonMoonlight as MuonReference
+from optimizers.dion_simple import Dion as DionSimple
 
 
 @dataclass
@@ -358,7 +359,7 @@ def main():
     # --- Model Initialization ---
     num_vocab = 50304  # nearest multiple of 128 for efficiency
     gpt_config = GPTConfig(
-        block_size=args.sequence_length,
+        sequence_len=args.sequence_length,
         vocab_size=num_vocab,
         n_layer=args.n_layer,
         n_head=args.n_head,
@@ -482,6 +483,17 @@ def main():
             approx_method=cli_args.approx_method,
             qr_warmup_steps=int(args.qr_warmup * args.num_iterations),
             efficient=args.efficient,
+        )
+    elif args.optimizer == "dion_simple":
+        assert(
+            device_mesh is None
+        ), "Simplified version of Dion does not support device mesh"
+        opt = DionReference(
+            param_groups,
+            lr=args.lr,
+            mu=args.mu,
+            weight_decay=args.weight_decay,
+            rank=round(args.rank_fraction * args.model_dim),
         )
     elif args.optimizer == "muon_moonlight":
         assert (
