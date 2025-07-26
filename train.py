@@ -203,6 +203,7 @@ def main():
     parser.add_argument("--device_batch_size", type=int, default=None)
     parser.add_argument("--sequence_length", type=int, default=None)
     parser.add_argument("--warmup_ratio", type=float, default=None)
+    parser.add_argument("--warmdown_ratio", type=float, default=None)
 
     # ---------- wandb logging ----------
     parser.add_argument("--no_wandb", action="store_true", help="Disable wandb logging")
@@ -230,6 +231,11 @@ def main():
         "--opt_grad_sync",
         action="store_true",
         help="Do data-parallel gradient sync inside Dion optimizer",
+    )
+    parser.add_argument(
+        "--fast_fsdp",
+        action="store_true",
+        help="Optimizer FSDP for speed instead of memory efficiency",
     )
 
     # ---------- debugging ----------
@@ -375,9 +381,10 @@ def main():
         parallelize_gpt_model(
             model,
             device_mesh=device_mesh,
-            dp_name=None if cli_args.opt_grad_sync else "dp",
+            dp_name=(None if cli_args.opt_grad_sync else "dp"),
             fs_name="fs",
             tp_name="tp",
+            fsdp_reshard_after_forward=(not cli_args.fast_fsdp),
         )
         raw_model = model
 
@@ -530,7 +537,7 @@ def main():
         warmdown_iters = round(args.warmdown_ratio * args.num_iterations)
         if it < warmup_iters:
             return (it + 1) / warmup_iters
-        elif it < args.num_iterations - warmdown_iters:
+        elif it <= args.num_iterations - warmdown_iters:
             return 1.0
         else:
             return (args.num_iterations - it) / warmdown_iters
@@ -609,8 +616,15 @@ def main():
             else:
                 if isinstance(model, FSDPModule):
                     # Gradient accumulation for DP on top of FSDP
-                    # FSDP always synchronizes sharded gradients via reduce-scatter
                     model.set_is_last_backward(i == train_accumulation_steps)
+                    if cli_args.fast_fsdp:
+                        # Only reshard and reduce-scatter gradients upon the last backward pass
+                        # Keep the entire unsharded model in memory during gradient accumulation
+                        model.set_reshard_after_backward(i == train_accumulation_steps)
+                        model.set_requires_gradient_sync(i == train_accumulation_steps)
+                    else:
+                        # FSDP always synchronizes sharded gradients via reduce-scatter
+                        model.set_requires_gradient_sync(True)
                 loss.backward()
 
         # Gradient norm
