@@ -73,6 +73,10 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
+        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+            raise ValueError(
+                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+            )
 
         # Default arguments for each param group
         defaults = dict(
@@ -94,7 +98,7 @@ class Muon(Optimizer):
         if isinstance(distributed_mesh, DeviceMesh):
             if distributed_mesh.ndim != 1:
                 raise ValueError(
-                    f"Only 1D DeviceMesh is supported, but got {distributed_mesh.ndim}D"
+                    f"Only 1D DeviceMesh is supported, but got {distributed_mesh.ndim}D. For HSDP, provide the 1D sharded sub-mesh."
                 )
             self._device_rank = distributed_mesh.get_local_rank()
             self._world_size = distributed_mesh.size()
@@ -159,7 +163,6 @@ class Muon(Optimizer):
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
-        # Schedule Muon tasks first so that scalar updates can fill scheduler gaps
         all_tasks = chain(muon_tasks, lion_tasks, adamw_tasks)
         runtime = AsyncRuntime(all_tasks, max_concurrent_tasks=3)
         runtime.run()
@@ -220,10 +223,11 @@ class Muon(Optimizer):
                         )
 
                     # Find the sharded placement and get its mesh and tensor dimensions
+                    # Skip any Shard() placements on size-1 mesh dimension = Replicate()
                     shard_placements = [
                         (i, p)
                         for i, p in enumerate(params[0].placements)
-                        if p.is_shard()
+                        if p.is_shard() and params[0].device_mesh.size(i) > 1
                     ]
                     if len(shard_placements) == 1:
                         sharded_mesh_dim = shard_placements[0][0]
@@ -234,14 +238,14 @@ class Muon(Optimizer):
                         )
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
-                    if sharded_mesh_dim is not None:
-                        if (
-                            params[0].device_mesh.get_group(sharded_mesh_dim)
-                            != self._process_group
-                        ):
-                            raise ValueError(
-                                f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
-                            )
+                    if (
+                        sharded_mesh_dim is not None
+                        and params[0].device_mesh.get_group(sharded_mesh_dim)
+                        != self._process_group
+                    ):
+                        raise ValueError(
+                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
+                        )
 
                 yield AsyncTask(
                     muon_update_batch_async(
@@ -438,14 +442,21 @@ def muon_update_batch_async(
             epsilon=epsilon,
         )
 
-        # Allocate empty tensors to receive updates from other devices
-        U = [torch.empty_like(u) for u in U]
+        if process_group is not None and process_group.size() > 1:
+            # Allocate empty tensors to receive updates from other devices
+            U = [torch.empty_like(u) for u in U]
 
-        # All gather orthogonalized results from other devices into buffer
-        if process_group is not None:
-            work = dist.all_gather(U, single_matrix, group=process_group, async_op=True)
+            # All gather orthogonalized results from other devices into buffer
+            work = dist.all_gather(
+                U, single_matrix.contiguous(), group=process_group, async_op=True
+            )
             yield
             work.wait()
+
+        else:
+            # Single GPU case, no need to gather
+            assert world_size == 1
+            U = [single_matrix]
 
     # Compute scaled learning rate
     # Do this before to_local(X) because we use the full tensor shape, not the shard shape

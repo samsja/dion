@@ -4,7 +4,6 @@ model_dim: 768
 n_layer: 12
 n_head: 6
 sequence_length: 1024
-vocab_size: 50304   # (implicitly set in code)
 
 # — Batching & Training —
 batch_size: 1024
@@ -22,7 +21,6 @@ beta: 0.9
 weight_decay: 0.01
 qr_warmup: 0.05 # QR warmup for faster training. Used when efficiency = true.
 oversample: 1.25
-adam_lr: 0.002
 
 # — Validation & Checkpointing —
 val_loss_every: 125
@@ -45,7 +43,7 @@ debug: false
 no_compile: false
 
 
-optimizer: dion 
+optimizer: dion_reference
 efficient: true
 scalar_opt: lion
 lr: 0.02

@@ -4,7 +4,6 @@ import os
 import time
 import torch
 import torch.distributed as dist
-import uuid
 import wandb
 import yaml
 
@@ -22,7 +21,7 @@ from models.gpt_utils import DistributedDataLoader
 from optimizers.dion import Dion
 from optimizers.muon import Muon
 from optimizers.dion_reference import Dion as DionReference
-from optimizers.muon_reference import MuonMoonlight as MuonReference
+from optimizers.muon_reference import Muon as MuonReference
 from optimizers.dion_simple import Dion as DionSimple
 
 
@@ -49,30 +48,28 @@ class Hyperparameters:
     val_loss_every: int = 125
     val_tokens: int = 10485760
     save_every: int = 0
-    wandb_project_name: str = "test"
+    wandb_project_name: str = "dion-test"
 
     # Optimizer
     optimizer: str = "dion"
     scalar_opt: str = "lion"
-    efficient: bool = False
-    muon_adjust_lr: str = "spectral_norm"  # for Muon only
 
-    # Hyperparameters
+    # Main optimizer hyperparameters
     lr: float = 0.02
-    adam_lr: float = 0.002
     mu: float = 0.95
-    beta: float = 0.9
     weight_decay: float = 0.01
     rank_fraction: float = 0.125
-    oversample: float = 1.25
-    qr_warmup: float = 0.05
 
-    power_iters: int = 1
-    approx_method: str = "qr"  # for DionOld and DionNorm optimizers
+    # Optimizer specific hyperparameters
+    oversample: float = 1.25  # for Dion only
+    qr_warmup: float = 0.05  # for DionReference only
+    approx_method: str = "qr"  # for DionReference only
+    efficient: bool = False  # for DionReference only
+    adjust_lr: str = "spectral_norm"  # for Muon only
 
 
 # Helper function to only print on global rank 0
-MASTER_PROCESS = False
+MASTER_PROCESS = True
 
 
 def print0(*args):
@@ -80,67 +77,9 @@ def print0(*args):
         print(*args)
 
 
-def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
-    # Initialize device mesh for distributed training
-    # If all mesh dimensions are None, we default to using DDP
-    assert torch.cuda.is_available(), "CUDA must be available!"
-    rank = int(os.environ["RANK"])
-    local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-
-    # Set global master process flag
-    global MASTER_PROCESS
-    MASTER_PROCESS = rank == 0
-
-    mesh_dims = (dp_size, fs_size, tp_size)
-    if all(d is None for d in mesh_dims):
-        # If no mesh dimensions given, initialize process group for DDP
-        device_mesh = None
-        dist.init_process_group(backend="nccl")
-        device = f"cuda:{local_rank}"
-        torch.cuda.set_device(device)
-        print0(f"Initialized DDP with world size {world_size}")
-
-    else:
-        # Use device mesh for distributed training
-        # All mesh dimensions must be specified
-        assert all(
-            d is not None for d in mesh_dims
-        ), f"All mesh dimensions (dp_size, fs_size, tp_size) must be specified, but got ({dp_size}, {fs_size}, {tp_size})"
-
-        # Check if we have the right number of GPUs
-        total_gpus = dp_size * fs_size * tp_size
-        assert world_size == total_gpus, (
-            f"World size {world_size} does not match expected size {total_gpus} "
-            f"(DP {dp_size}, FS {fs_size}, TP {tp_size})"
-        )
-
-        device_mesh = init_device_mesh(
-            device_type="cuda",
-            mesh_shape=(dp_size, fs_size, tp_size),
-            mesh_dim_names=("dp", "fs", "tp"),
-        )
-        print0("Device mesh:", device_mesh)
-
-    return device_mesh
-
-
-def override_args_from_cli(
-    args: Hyperparameters, cli_args: argparse.Namespace
-) -> Hyperparameters:
-    for key, value in vars(cli_args).items():
-        if value is not None:
-            if hasattr(args, key):
-                print(f"Setting hyperparameter {key}={value}")
-                setattr(args, key, value)
-    return args
-
-
-def main():
+def parse_cli_args():
     # --- Command-line argument parsing ---
-    parser = argparse.ArgumentParser(
-        description="Training script with input and output directories"
-    )
+    parser = argparse.ArgumentParser()
     parser.add_argument(
         "--config",
         type=str,
@@ -168,15 +107,9 @@ def main():
     parser.add_argument(
         "--scalar_opt", type=str, help="Optimizer for scalar parameters", default=None
     )
-    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=None, help="Base learning rate")
     parser.add_argument(
-        "--adam_lr",
-        type=float,
-        default=None,
-        help="Adam learning rate for scalar params",
-    )
-    parser.add_argument(
-        "--muon_adjust_lr",
+        "--adjust_lr",
         type=str,
         default=None,
         help="Adjust learning rate method for Muon",
@@ -243,6 +176,9 @@ def main():
     parser.add_argument(
         "--no_compile", action="store_true", help="Disable torch.compile"
     )
+    parser.add_argument(
+        "--no_triton", action="store_true", help="Disable Triton kernels"
+    )
 
     cli_args = parser.parse_args()
     if cli_args.config:
@@ -256,14 +192,288 @@ def main():
             if getattr(cli_args, k, None) is None:
                 setattr(cli_args, k, v)
 
-    # --- Distributed setup ---
+    return cli_args
+
+
+def override_args_from_cli(
+    hp: Hyperparameters, cli_args: argparse.Namespace
+) -> Hyperparameters:
+    for key, value in vars(cli_args).items():
+        if value is not None:
+            if hasattr(hp, key):
+                print0(f"Setting hyperparameter {key}={value}")
+                setattr(hp, key, value)
+    return hp
+
+
+def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
+    """
+    Initialize DeviceMesh or ProcessGroup for distributed training.
+    If all mesh dimensions are None, we default to using DDP.
+    """
+    assert torch.cuda.is_available(), "CUDA must be available"
+    assert torch.distributed.is_available(), "Distributed must be available"
+
+    # Check that environment variables are set
+    assert all(
+        var in os.environ for var in ["RANK", "LOCAL_RANK", "WORLD_SIZE"]
+    ), "This script must be launched using the 'torchrun' command."
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+
+    # Set global master process flag
+    global MASTER_PROCESS
+    MASTER_PROCESS = rank == 0
+
+    mesh_dims = (dp_size, fs_size, tp_size)
+    if all(d is None for d in mesh_dims):
+        # If no mesh dimensions given, initialize process group for DDP
+        device_mesh = None
+        dist.init_process_group(backend="nccl")
+        device = f"cuda:{local_rank}"
+        torch.cuda.set_device(device)
+
+        print0("=" * 80)
+        print0("Distributed training initialized with DDP")
+        print0(f"World size: {world_size}")
+
+    else:
+        # Use device mesh for distributed training
+        # All mesh dimensions must be specified
+        assert all(
+            d is not None for d in mesh_dims
+        ), f"All mesh dimensions (dp_size, fs_size, tp_size) must be specified, but got ({dp_size}, {fs_size}, {tp_size})"
+
+        # Check if we have the right number of GPUs
+        total_gpus = dp_size * fs_size * tp_size
+        assert world_size == total_gpus, (
+            f"World size {world_size} does not match expected size {total_gpus} "
+            f"(DP {dp_size}, FS {fs_size}, TP {tp_size})"
+        )
+        device_mesh = init_device_mesh(
+            device_type="cuda",
+            mesh_shape=(dp_size, fs_size, tp_size),
+            mesh_dim_names=("dp", "fs", "tp"),
+        )
+
+        print0("=" * 80)
+        print0("Distributed training initialized with DeviceMesh")
+        print0(f"World size: {world_size}")
+        print0(f"DP size: {dp_size}")
+        print0(f"FS size: {fs_size}")
+        print0(f"TP size: {tp_size}")
+        print0(device_mesh)
+
+    return device_mesh
+
+
+def init_optimizer(
+    model: GPT,
+    device_mesh: Optional[DeviceMesh],
+    ddp_model: Optional[DDP],
+    hp: Hyperparameters,
+    cli_args: argparse.Namespace,
+):
+    # Check that we have a valid scalar optimizer
+    if hp.scalar_opt not in ["adamw", "lion"]:
+        raise ValueError(f"Unrecognized scalar optimizer: {hp.scalar_opt}")
+
+    # Separate the model's parameters based on their types
+    matrix_params = list(model.transformer.h.parameters())
+    embedding_params = list(model.transformer.wte.parameters())
+    lm_head_params = list(model.lm_head.parameters())
+
+    # Matrix params use optimizer default settings
+    param_groups = [dict(params=matrix_params)]
+
+    # Add additional param groups with the necessary configurations for scalar params
+    param_groups.append(
+        dict(
+            params=embedding_params,
+            algorithm=hp.scalar_opt,
+            lr=hp.lr,  # no LR adjustment for embedding parameters
+            betas=(0.95, 0.98),
+            weight_decay=0,  # no weight decay for embedding parameters
+        )
+    )
+    param_groups.append(
+        dict(
+            params=lm_head_params,
+            algorithm=hp.scalar_opt,
+            lr=hp.lr / math.sqrt(hp.model_dim),  # scale LR for lm_head
+            betas=(0.95, 0.98),
+            weight_decay=0,  # no weight decay for lm_head parameters
+        )
+    )
+
+    # Create the main optimizer
+    if hp.optimizer == "dion":
+        if device_mesh is not None:
+            replicate_mesh = device_mesh["dp"]
+            outer_shard_mesh = device_mesh["fs"]
+            inner_shard_mesh = device_mesh["tp"]
+        else:
+            assert ddp_model is not None
+            replicate_mesh = ddp_model.process_group
+            outer_shard_mesh = None
+            inner_shard_mesh = None
+        opt = Dion(
+            param_groups,
+            replicate_mesh=replicate_mesh,
+            outer_shard_mesh=outer_shard_mesh,
+            inner_shard_mesh=inner_shard_mesh,
+            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
+            rank_fraction=hp.rank_fraction,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            oversample=hp.oversample,
+        )
+
+    elif hp.optimizer == "muon":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for Muon
+            if device_mesh["tp"].size() > 1:
+                raise ValueError("Tensor parallel is not supported by Muon.")
+            distributed_mesh = (
+                device_mesh["fs"] if device_mesh["fs"].size() > 1 else device_mesh["dp"]
+            )
+            comm_method = "all-to-all" if device_mesh["fs"].size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"Muon LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed Muon using: {comm_method}")
+        opt = Muon(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+
+    elif hp.optimizer == "dion_reference":
+        assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
+        assert hp.approx_method is not None
+        if hp.efficient == True:
+            assert hp.rank_fraction <= 0.5, (
+                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
+                "for rank_fraction=1 is under development"
+            )
+        opt = DionReference(
+            param_groups,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            rank=round(hp.rank_fraction * hp.model_dim),
+            approx_method=hp.approx_method,
+            qr_warmup_steps=round(hp.qr_warmup * hp.num_iterations),
+            efficient=hp.efficient,
+        )
+
+    elif hp.optimizer == "dion_simple":
+        assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
+        opt = DionSimple(
+            param_groups,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            rank=round(hp.rank_fraction * hp.model_dim),
+        )
+
+    elif hp.optimizer == "muon_reference":
+        print0(f"Muon LR adjust method: {hp.adjust_lr}")
+        opt = MuonReference(
+            param_groups,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            nesterov=True,
+            adjust_lr=hp.adjust_lr,
+        )
+
+    elif hp.optimizer == "adamw":
+        print0("Using AdamW for all params, scalar optimizer will be ignored")
+        print0("Setting all param groups to use unscaled base learning rate")
+        for group in param_groups:
+            group["lr"] = hp.lr
+            group["betas"] = (0.9, 0.95)  # AdamW default betas
+        opt = torch.optim.AdamW(
+            param_groups,
+            lr=hp.lr,
+            betas=(0.9, 0.95),
+            weight_decay=hp.weight_decay,
+        )
+
+    else:
+        raise ValueError(f"Unsupported optimizer: {hp.optimizer}")
+
+    # Check opt_grad_sync and optimizer combination
+    if cli_args.opt_grad_sync and hp.optimizer != "dion":
+        # Results will be wrong if opt_grad_sync is set for non-Dion optimizer
+        raise ValueError("--opt_grad_sync is set for non-Dion optimizer")
+    if not cli_args.opt_grad_sync and hp.optimizer == "dion":
+        # Using Dion without opt_grad_sync means we won't get communication savings
+        print0("Warning: not using --opt_grad_sync for Dion optimizer")
+
+    return opt
+
+
+def main():
+    # --- Parse command line arguments and set hyperparams ---
+    cli_args = parse_cli_args()
+    hp = Hyperparameters()
+    hp = override_args_from_cli(hp, cli_args)
+    if cli_args.inv_rank_fraction:
+        hp.rank_fraction = 1.0 / cli_args.inv_rank_fraction
+
+    # --- Distributed training initialization ---
     device_mesh = init_distributed(
         dp_size=cli_args.dp_size,
         fs_size=cli_args.fs_size,
         tp_size=cli_args.tp_size,
     )
+    print0("=" * 80)
+
+    # --- Logging and wandb initialization ---
+    # Load hyperparameters and update with CLI arguments
+    # Create a name to identify this run
+    opt_name = f"{hp.optimizer}+{hp.scalar_opt}"
+    run_name = f"({opt_name})_bs={hp.batch_size}_lr={hp.lr}"
+    if "dion" in hp.optimizer:
+        run_name += f"_sp={hp.rank_fraction}"
+        if hp.efficient:
+            run_name += f"_eff=True"
+    if cli_args.dp_size is not None:
+        run_name += (
+            f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
+        )
+    if cli_args.wandb_job_name:
+        run_name += f"_{cli_args.wandb_job_name}"
+
+    # Initialize wandb
+    if MASTER_PROCESS and not cli_args.no_wandb:
+        assert hp.wandb_project_name, "wandb project name is required"
+        if not cli_args.debug:
+            wandb.login(
+                key=os.environ.get("WANDB_API_KEY"),
+                host=os.environ.get("WANDB_HOST"),
+                timeout=0,
+            )
+            wandb.init(project=hp.wandb_project_name, name=run_name, config=hp.__dict__)
+
+    print0(f"Run name: {run_name}")
+    print0(f"Debug mode: {cli_args.debug}")
+
+    # --- DataLoader Setup ---
     if device_mesh is not None:
-        # Combine replicated and sharded data parallel meshes
+        # Combine replicated and sharded data parallel meshes for data loading
         data_parallel_mesh = device_mesh["dp", "fs"]._flatten()
         data_parallel_size = data_parallel_mesh.size()
         data_parallel_rank = data_parallel_mesh.get_local_rank()
@@ -273,85 +483,56 @@ def main():
         data_parallel_size = dist.get_world_size()
         data_parallel_rank = dist.get_rank()
 
-    # --- Logging and wandb initialization ---
-    run_id = str(uuid.uuid4())
-    logdir = (
-        os.path.join(cli_args.output, run_id)
-        if cli_args.output
-        else os.path.join("logs", run_id)
-    )
-    os.makedirs(logdir, exist_ok=True)
-    logfile = os.path.join(logdir, f"{run_id}.txt")
-    with open(logfile, "w") as f:
-        f.write("Starting training run...\n")
-
-    # Load hyperparameters and update with CLI arguments
-    args = Hyperparameters()
-    args = override_args_from_cli(args, cli_args)
-    if cli_args.inv_rank_fraction:
-        args.rank_fraction = 1.0 / cli_args.inv_rank_fraction
-
-    if args.efficient == True:
-        print0("Using efficient Dion optimizer")
-        if args.rank_fraction > 0.5:
-            raise ValueError(
-                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
-                "for rank_fraction=1 is under development"
-            )
-
-    if MASTER_PROCESS and not cli_args.no_wandb:
-        assert args.wandb_project_name, "wandb project name is required"
-        opt_name = f"{args.optimizer}+{args.scalar_opt}"
-        run_name = f"({opt_name})_bs={args.batch_size}_lr={args.lr}"
-        if "dion" in args.optimizer:
-            run_name += f"_sp={args.rank_fraction}"
-            if args.efficient:
-                run_name += f"_eff=True"
-
-        if cli_args.dp_size is not None:
-            run_name += (
-                f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
-            )
-        if cli_args.wandb_job_name:
-            run_name += f"_{cli_args.wandb_job_name}"
-        if not cli_args.debug:
-            wandb.login(
-                key=os.environ.get("WANDB_API_KEY"),
-                host=os.environ.get("WANDB_HOST"),
-                timeout=0,
-            )
-            wandb.init(
-                project=args.wandb_project_name, name=run_name, config=args.__dict__
-            )
-
-    # --- DataLoader Setup ---
     if cli_args.debug:
         # in debug mode, make batch size very small
-        args.batch_size = 2 * data_parallel_size
-        args.device_batch_size = 1
+        hp.batch_size = 2 * data_parallel_size
+        hp.device_batch_size = 1
 
-    B, T = args.device_batch_size, args.sequence_length
-    assert args.val_tokens % (B * T * data_parallel_size) == 0, "Invalid val_tokens"
-    val_steps = args.val_tokens // (B * T * data_parallel_size)
+    # Calculate validation steps
+    tokens_in_global_batch = (
+        hp.device_batch_size * hp.sequence_length * data_parallel_size
+    )
+    assert hp.val_tokens % tokens_in_global_batch == 0, "Invalid val_tokens"
+    val_steps = hp.val_tokens // tokens_in_global_batch
 
     if cli_args.debug:
         # train for just a few steps
-        args.num_iterations = 300
+        hp.num_iterations = 20
         val_steps = min(val_steps, 2)
 
-    assert args.batch_size % (B * data_parallel_size) == 0, "Invalid batch_size"
-    train_accumulation_steps = args.batch_size // (B * data_parallel_size)
+    # Calculate gradient accumulation steps
+    sequences_in_global_batch = hp.device_batch_size * data_parallel_size
+    assert hp.batch_size % sequences_in_global_batch == 0, "Invalid batch_size"
+    grad_accum_steps = hp.batch_size // sequences_in_global_batch
+    assert grad_accum_steps >= 1, "Invalid grad_accum_steps"
 
-    train_glob = os.path.join(args.data_dir, "fineweb_train_*.bin")
-    val_glob = os.path.join(args.data_dir, "fineweb_val_*.bin")
+    print0(f"Global batch size: {hp.batch_size} sequences")
+    print0(f"Per-device batch size: {hp.device_batch_size} sequences")
+    print0(f"Sequence length: {hp.sequence_length} tokens")
+    print0(f"Gradient accumulation steps: {grad_accum_steps}")
+    print0("=" * 80)
+
+    train_glob = os.path.join(hp.data_dir, "fineweb_train_*.bin")
+    val_glob = os.path.join(hp.data_dir, "fineweb_val_*.bin")
+
+    print0(f"Training data: {train_glob}")
+    print0(f"Validation data: {val_glob}")
 
     # Each data parallel rank gets different data
     # TP ranks must all use identical data
     train_loader = DistributedDataLoader(
-        train_glob, B, T, data_parallel_rank, data_parallel_size
+        train_glob,
+        hp.device_batch_size,
+        hp.sequence_length,
+        data_parallel_rank,
+        data_parallel_size,
     )
     val_loader = DistributedDataLoader(
-        val_glob, B, T, data_parallel_rank, data_parallel_size
+        val_glob,
+        hp.device_batch_size,
+        hp.sequence_length,
+        data_parallel_rank,
+        data_parallel_size,
     )
 
     print0(
@@ -360,16 +541,20 @@ def main():
     print0(
         f"Validation DataLoader: {val_loader.ntok_total} tokens across {len(val_loader.files)} files"
     )
-    x, y = train_loader.next_batch()
+    print0("=" * 80)
 
     # --- Model Initialization ---
+    print0(f"Model dimension: {hp.model_dim}")
+    print0(f"Number of layers: {hp.n_layer}")
+    print0(f"Number of heads: {hp.n_head}")
+
     num_vocab = 50304  # nearest multiple of 128 for efficiency
     gpt_config = GPTConfig(
-        sequence_len=args.sequence_length,
+        sequence_len=hp.sequence_length,
         vocab_size=num_vocab,
-        n_layer=args.n_layer,
-        n_head=args.n_head,
-        n_embd=args.model_dim,
+        n_layer=hp.n_layer,
+        n_head=hp.n_head,
+        n_embd=hp.model_dim,
     )
     with torch.device("meta"):
         model = GPT(gpt_config)
@@ -405,183 +590,83 @@ def main():
             raise ValueError(f"Parameter {i} is not contiguous")
 
     num_params = sum(p.numel() for p in model.parameters())
-    print0(f"----------Total parameters: {num_params}")
+    print0(f"Total parameters: {num_params}")
+    print0(f"Using torch.compile: {not cli_args.no_compile}")
+
+    # Print model architecture
+    print0(model)
+    print0("=" * 80)
 
     # --- Optimizer Setup ---
-    matrix_params = list(raw_model.transformer.h.parameters())
-    embedding_params = list(raw_model.transformer.wte.parameters())
-    lm_head_params = list(raw_model.lm_head.parameters())
-    param_groups = [dict(params=matrix_params)]
+    print0(f"Optimizer: {hp.optimizer}")
+    print0(f"Scalar optimizer: {hp.scalar_opt}")
+    print0(f"Base learning rate: {hp.lr}")
 
-    # Create parameter groups for scalar optimizer
-    assert args.scalar_opt in ["adamw", "lion", "clion"]
-    param_groups.append(
-        dict(
-            params=embedding_params,
-            algorithm=args.scalar_opt,
-            lr=args.lr,
-            betas=(0.95, 0.98),
-            weight_decay=0,
-        )
-    )
-    param_groups.append(
-        dict(
-            params=lm_head_params,
-            algorithm=args.scalar_opt,
-            lr=args.lr / math.sqrt(args.model_dim),  # scale LR for lm_head
-            betas=(0.95, 0.98),
-            weight_decay=0,
-        )
+    optimizer = init_optimizer(
+        model=raw_model,
+        device_mesh=device_mesh,
+        ddp_model=model if isinstance(model, DDP) else None,
+        hp=hp,
+        cli_args=cli_args,
     )
 
-    # Get the device mesh for the optimizer
-    if device_mesh is not None:
-        replicate_mesh = device_mesh["dp"]
-        outer_shard_mesh = device_mesh["fs"]
-        inner_shard_mesh = device_mesh["tp"]
-    else:
-        replicate_mesh = model.process_group
-        outer_shard_mesh = None
-        inner_shard_mesh = None
-
-    # Create the main optimizer
-    optimizers = []
-    if args.optimizer == "dion":
-        opt = Dion(
-            param_groups,
-            replicate_mesh=replicate_mesh,
-            outer_shard_mesh=outer_shard_mesh,
-            inner_shard_mesh=inner_shard_mesh,
-            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
-            rank_fraction=args.rank_fraction,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "muon":
-        if device_mesh is not None:
-            assert not (
-                cli_args.fs_size > 1 and cli_args.dp_size > 1
-            ), "Hybrid sharded data parallel is not supported by Muon."
-            assert cli_args.tp_size == 1, "Tensor parallel is not supported by Muon."
-            distributed_mesh = (
-                device_mesh["dp"] if cli_args.dp_size > 1 else device_mesh["fs"]
-            )
-        else:
-            distributed_mesh = model.process_group  # using DDP
-        opt = Muon(
-            param_groups,
-            distributed_mesh=distributed_mesh,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-        )
-    elif args.optimizer == "dion_reference":
-        assert (
-            device_mesh is None
-        ), "Simplified version of Dion does not support device mesh"
-        assert cli_args.approx_method is not None
-        opt = DionReference(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim),
-            approx_method=cli_args.approx_method,
-            qr_warmup_steps=int(args.qr_warmup * args.num_iterations),
-            efficient=args.efficient,
-        )
-    elif args.optimizer == "dion_simple":
-        assert (
-            device_mesh is None
-        ), "Simplified version of Dion does not support device mesh"
-        opt = DionReference(
-            param_groups,
-            lr=args.lr,
-            mu=args.mu,
-            weight_decay=args.weight_decay,
-            rank=round(args.rank_fraction * args.model_dim),
-        )
-    elif args.optimizer == "muon_moonlight":
-        assert (
-            device_mesh is None
-        ), "Simplified version of Dion does not support device mesh"
-        opt = MuonReference(
-            muon_params=matrix_params,
-            adamw_params=[pg for pg in param_groups if pg["algorithm"] == "adamw"],
-            lion_params=[pg for pg in param_groups if pg["algorithm"] == "lion"],
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            momentum=args.mu,
-            adjust_lr=args.muon_adjust_lr,
-        )
-    elif args.optimizer == "adam":
-        opt = torch.optim.AdamW(
-            param_groups,
-            lr=args.lr,
-            betas=(0.9, 0.95),
-            weight_decay=args.weight_decay,
-        )
-    else:
-        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
-    optimizers.append(opt)
-
-    # Check opt_grad_sync and optimizer combination
-    if cli_args.opt_grad_sync and args.optimizer != "dion":
-        print0("Warning: --opt_grad_sync is set for non-Dion optimizer")
-    if not cli_args.opt_grad_sync and args.optimizer == "dion":
-        print0("Warning: Not using --opt_grad_sync for Dion optimizer")
-
+    # Learning rate scheduler
     def get_lr(it):
-        warmup_iters = round(args.warmup_ratio * args.num_iterations)
-        warmdown_iters = round(args.warmdown_ratio * args.num_iterations)
+        warmup_iters = round(hp.warmup_ratio * hp.num_iterations)
+        warmdown_iters = round(hp.warmdown_ratio * hp.num_iterations)
         if it < warmup_iters:
             return (it + 1) / warmup_iters
-        elif it <= args.num_iterations - warmdown_iters:
+        elif it <= hp.num_iterations - warmdown_iters:
             return 1.0
         else:
-            return (args.num_iterations - it) / warmdown_iters
+            return (hp.num_iterations - it) / warmdown_iters
 
-    schedulers = [
-        torch.optim.lr_scheduler.LambdaLR(opt, lambda it: get_lr(it))
-        for opt in optimizers
-    ]
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, get_lr)
+
+    print0("=" * 80)
 
     # --- Training Loop ---
+    x, y = train_loader.next_batch()
     training_time_ms = 0
     torch.cuda.synchronize()
     t0 = time.time()
-    pbar = tqdm(total=args.num_iterations, desc="Training", disable=not MASTER_PROCESS)
 
     # Use autocast for mixed precision
-    ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
-    for step in range(args.num_iterations + 1):
-        last_step = step == args.num_iterations
+    pbar = tqdm(total=hp.num_iterations, desc="Training", disable=not MASTER_PROCESS)
+    for step in range(hp.num_iterations + 1):
+        # Skip the first few steps for timing to avoid torch.compile overhead
         if step == 10:
             training_time_ms = 0
+            torch.cuda.synchronize()
             t0 = time.time()
-        timed_steps = (step - 9) if step > 10 else float("nan")
+        timed_steps = (step - 10) if step > 10 else float("nan")
 
         # --- Validation ---
-        if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+        last_step = step == hp.num_iterations
+        if last_step or (hp.val_loss_every > 0 and step % hp.val_loss_every == 0):
+            # Measure elapsed time for training
             torch.cuda.synchronize()
             training_time_ms += 1000 * (time.time() - t0)
+
+            # Run validation
             model.eval()
             val_loader.reset()
             val_loss = torch.tensor(0.0, device=x.device)
             for _ in range(val_steps):
                 with torch.no_grad():
                     x_val, y_val = val_loader.next_batch()
-                    with ctx:
+                    with autocast_ctx:
                         loss = model(x_val, y_val)
-                        val_loss += loss
-            # Average loss across devices
+                    val_loss += loss
+
+            # Average validation loss across devices
             dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
             val_loss = val_loss.item() / val_steps
             log_message = (
-                f"step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} "
-                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms"
+                f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} "
+                f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps):.2f}ms"
             )
             print0(log_message)
             if MASTER_PROCESS and not cli_args.no_wandb and not cli_args.debug:
@@ -593,35 +678,36 @@ def main():
                     }
                 )
             pbar.set_postfix(val_loss=f"{val_loss:.4f}")
+
+            # Restart training time for the next iteration
             torch.cuda.synchronize()
             t0 = time.time()
-            model.train()
 
         if last_step:
             break
 
         model.train()
-        for i in range(1, train_accumulation_steps + 1):
-            with ctx:
+        for i in range(1, grad_accum_steps + 1):
+            with autocast_ctx:
                 loss = model(x, y)
-            train_loss = loss.detach()
-            loss = loss / train_accumulation_steps
+            train_loss = loss.detach()  # for logging
+            loss = loss / grad_accum_steps
             x, y = train_loader.next_batch()
 
             # Turn off DDP grad sync if opt_grad_sync is True
-            ddp_no_sync = i < train_accumulation_steps or cli_args.opt_grad_sync
+            ddp_no_sync = i < grad_accum_steps or cli_args.opt_grad_sync
             if isinstance(model, DDP) and ddp_no_sync:
                 with model.no_sync():
                     loss.backward()
             else:
                 if isinstance(model, FSDPModule):
                     # Gradient accumulation for DP on top of FSDP
-                    model.set_is_last_backward(i == train_accumulation_steps)
+                    model.set_is_last_backward(i == grad_accum_steps)
                     if cli_args.fast_fsdp:
                         # Only reshard and reduce-scatter gradients upon the last backward pass
                         # Keep the entire unsharded model in memory during gradient accumulation
-                        model.set_reshard_after_backward(i == train_accumulation_steps)
-                        model.set_requires_gradient_sync(i == train_accumulation_steps)
+                        model.set_reshard_after_backward(i == grad_accum_steps)
+                        model.set_requires_gradient_sync(i == grad_accum_steps)
                     else:
                         # FSDP always synchronizes sharded gradients via reduce-scatter
                         model.set_requires_gradient_sync(True)
@@ -632,9 +718,9 @@ def main():
             [p.grad for p in model.parameters() if p.grad is not None]
         )
 
-        for opt, sched in zip(optimizers, schedulers):
-            opt.step()
-            sched.step()
+        # Optimizer step
+        optimizer.step()
+        lr_scheduler.step()
         model.zero_grad(set_to_none=True)
 
         # Approximate updated training time just before logging
@@ -649,11 +735,12 @@ def main():
                 }
             )
         if MASTER_PROCESS and cli_args.debug:
-            print(
+            print0(
                 f"Step {step}: train_loss={train_loss.item():.4f}, grad_norm={grad_norm.item():.4f}"
             )
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
+        torch.cuda.synchronize()
         t0 = time.time()  # reset timer after optimizer step
 
     pbar.close()

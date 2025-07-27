@@ -99,7 +99,11 @@ class Dion(Optimizer):
                 for p in group["params"]:
                     if p.dim() != 2:
                         raise ValueError(
-                            f"Expected matrix parameters to be 2D tensor, got {p.dim()}D."
+                            f"Expected Dion parameters to be 2D tensor, but got {p.dim()}D."
+                        )
+                    if isinstance(p, DTensor):
+                        raise ValueError(
+                            "Dion optimizer does not support distributed tensors."
                         )
 
     @torch.no_grad()
@@ -123,10 +127,6 @@ class Dion(Optimizer):
 
             if algo == "dion":
                 for param in group["params"]:
-                    assert not isinstance(
-                        param, DTensor
-                    ), "DionSimple does not support distributed tensors."
-
                     if param.grad is None:
                         raise ValueError("Gradient is None.")
 
@@ -142,6 +142,7 @@ class Dion(Optimizer):
                         Q=state["Q"],
                         lr=lr,
                         mu=mu,
+                        weight_decay=weight_decay,
                         epsilon=self.epsilon,
                     )
 

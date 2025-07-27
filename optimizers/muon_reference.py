@@ -3,7 +3,8 @@ import os
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
-from torch.optim.optimizer import Optimizer
+from torch.optim.optimizer import Optimizer, ParamsT
+from typing import Optional, Tuple
 
 
 @torch.compile
@@ -28,9 +29,11 @@ def zeropower_via_newtonschulz5(G, steps=5, eps=1e-7):
 
 # Muon version based on code from Moonlight
 # https://github.com/MoonshotAI/Moonlight/blob/master/examples/toy_train.py
-class MuonMoonlight(Optimizer):
+class Muon(Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
+
+    Modified from original MoonshotAI implementation to take similar param groups as distributed Muon.
 
     Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
     processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
@@ -40,73 +43,73 @@ class MuonMoonlight(Optimizer):
     Some warnings:
     - We believe this optimizer is unlikely to work well for training with small batch size.
     - We believe it may not work well for finetuning pretrained models, but we haven't tested this.
-
-    Arguments:
-        muon_params: The parameters to be optimized by Muon.
-        lr: The learning rate. The updates will have spectral norm of `lr`. (0.02 is a good default)
-        momentum: The momentum used by the internal SGD. (0.95 is a good default)
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iterations to run. (6 is probably always enough)
-        adamw_params: The parameters to be optimized by AdamW. Any parameters in `muon_params` which are
-        {0, 1}-D or are detected as being the embed or lm_head will be optimized by AdamW as well.
-        adamw_lr: The learning rate for the internal AdamW.
-        adamw_betas: The betas for the internal AdamW.
-        adamw_eps: The epsilon for the internal AdamW.
     """
 
     def __init__(
         self,
-        muon_params=None,
-        lr=1e-3,
-        weight_decay=0.1,
-        momentum=0.95,
-        nesterov=True,
-        ns_steps=5,
-        adjust_lr="adam",
-        adamw_params=None,
-        lion_params=None,
-        betas=(0.95, 0.95),
-        epsilon=1e-8,
+        params: ParamsT,
+        lr: float = 1e-3,
+        mu: float = 0.95,
+        betas: Tuple[float, float] = (0.95, 0.95),
+        weight_decay: float = 0.1,
+        epsilon: float = 1e-8,
+        nesterov: bool = True,
+        adjust_lr: Optional[str] = "spectral_norm",
+        ns_steps: int = 5,
     ):
+        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+            raise ValueError(
+                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+            )
 
         defaults = dict(
             lr=lr,
             weight_decay=weight_decay,
-            momentum=momentum,
+            momentum=mu,
             nesterov=nesterov,
             ns_steps=ns_steps,
             adjust_lr=adjust_lr,
             betas=betas,
             epsilon=epsilon,
         )
-
-        muon_params = list(muon_params) if muon_params is not None else []
-        adamw_params = list(adamw_params) if adamw_params is not None else []
-        lion_params = list(lion_params) if lion_params is not None else []
-        params = muon_params + adamw_params + lion_params
         super().__init__(params, defaults)
 
+        if isinstance(params, dict):
+            params = [params]
+
         # Sort parameters into those for which we will use Muon, and those for which we will not
-        for param_or_param_group in muon_params:
+        for param_or_param_group in params:
+            # Input is a list of param_group dicts
             if isinstance(param_or_param_group, dict):
+                algo = param_or_param_group.get("algorithm", "muon")
+                if algo not in ("muon", "adamw", "lion"):
+                    raise ValueError(f"Unknown algorithm: {algo}")
+
                 for p in param_or_param_group["params"]:
-                    assert p.ndim == 2, p.ndim
-                    self.state[p]["algorithm"] = "muon"
+                    self.state[p]["algorithm"] = algo
+                    if algo == "muon" and p.ndim != 2:
+                        raise ValueError(
+                            f"Muon requires 2D parameters, but got {p.ndim}D"
+                        )
+
+            # Input is a list of parameter tensors
+            # Assume Muon by default, because we require scalar params be specified explicitly
             else:
-                assert param_or_param_group.ndim == 2, param_or_param_group.ndim
-                self.state[param_or_param_group]["algorithm"] = "muon"
-        for param_or_param_group in adamw_params:
-            if isinstance(param_or_param_group, dict):
-                for p in param_or_param_group["params"]:
-                    self.state[p]["algorithm"] = "adamw"
-            else:
-                self.state[param_or_param_group]["algorithm"] = "adamw"
-        for param_or_param_group in lion_params:
-            if isinstance(param_or_param_group, dict):
-                for p in param_or_param_group["params"]:
-                    self.state[p]["algorithm"] = "lion"
-            else:
-                self.state[param_or_param_group]["algorithm"] = "lion"
+                if isinstance(param_or_param_group, torch.Tensor):
+                    p = param_or_param_group
+                elif (
+                    isinstance(param_or_param_group, tuple)
+                    and len(param_or_param_group) == 2
+                ):
+                    # (name, param) tuple
+                    p = param_or_param_group[1]
+                else:
+                    raise ValueError(
+                        f"Invalid parameter type: {type(param_or_param_group)}"
+                    )
+                self.state[p]["algorithm"] = "muon"
+                if p.ndim != 2:
+                    raise ValueError(f"Muon requires 2D parameters, but got {p.ndim}D")
 
     def adjust_lr_to_match_adam(self, lr, param_shape):
         A, B = param_shape[:2]
@@ -123,6 +126,7 @@ class MuonMoonlight(Optimizer):
         adjusted_lr = lr * math.sqrt(fan_out / fan_in)
         return adjusted_lr
 
+    @torch.no_grad()
     def step(self, closure=None):
         """Perform a single optimization step.
 
@@ -190,9 +194,11 @@ class MuonMoonlight(Optimizer):
                     u = zeropower_via_newtonschulz5(g, steps=group["ns_steps"], eps=eps)
 
                 # scale update
-                if group["adjust_lr"] == "spectral_norm":
+                if group["adjust_lr"] is None:
+                    adjusted_lr = lr
+                elif group["adjust_lr"] == "spectral_norm":
                     adjusted_lr = self.adjust_lr_spectral_norm(lr, p.shape)
-                elif group["adjust_lr"] == "adam":
+                elif group["adjust_lr"] == "rms_norm":
                     adjusted_lr = self.adjust_lr_to_match_adam(lr, p.shape)
                 else:
                     raise ValueError(f"Unknown adjust_lr value: {group['adjust_lr']}")
@@ -207,7 +213,9 @@ class MuonMoonlight(Optimizer):
             #       AdamW backup       #
             ############################
 
-            adamw_params = [p for p in group["params"] if not self.state[p]["use_muon"]]
+            adamw_params = [
+                p for p in group["params"] if self.state[p]["algorithm"] == "adamw"
+            ]
             lr = group["lr"]
             beta1, beta2 = group["betas"]
             eps = group["epsilon"]
@@ -294,6 +302,7 @@ class MuonKellerJordan(Optimizer):
                 if isinstance(p, DTensor):
                     raise NotImplementedError("DTensor parameters not supported.")
 
+    @torch.no_grad()
     def step(self):
         for group in self.param_groups:
             lr = group["lr"]

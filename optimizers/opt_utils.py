@@ -47,7 +47,7 @@ class AsyncTask:
 
     def __init__(self, generator: Generator[None, None, None]):
         self._generator = generator
-        next(self._generator)  # Start running the generator
+        self.run()  # Start running the generator
 
     def run(self) -> bool:
         # Run the next step of the async task.

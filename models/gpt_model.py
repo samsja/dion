@@ -239,12 +239,13 @@ def parallelize_gpt_model(
     dp_name: Optional[str] = "dp",
     fs_name: Optional[str] = "fs",
     tp_name: Optional[str] = "tp",
+    fsdp_reshard_after_forward: bool = True,
 ):
     """
     Parallelize GPT model using the given device mesh and sharding axis names.
     The model is modified in place.
 
-    dp_name: Name of the mesh dimension to apply data parallel (replicate model weights for hybrid sharding)
+    dp_name: Name of the mesh dimension to apply (replicated) data parallel
     fs_name: Name of the mesh dimension to apply fully sharded data parallel
     tp_name: Name of the mesh dimension to apply tensor parallel
     """
@@ -276,14 +277,15 @@ def parallelize_gpt_model(
     # Apply TP
     if tp_name:
         tp_mesh = device_mesh[tp_name]
-        _apply_tp(model, tp_mesh)
+        if tp_mesh.size() > 1:
+            _apply_tp(model, tp_mesh)
 
     # Apply FSDP
     if fs_name:
         fsdp_mesh = (
             device_mesh[fs_name] if not dp_name else device_mesh[dp_name, fs_name]
         )
-        _apply_fsdp(model, fsdp_mesh)
+        _apply_fsdp(model, fsdp_mesh, fsdp_reshard_after_forward)
 
 
 def _apply_tp(model: GPT, tp_mesh: DeviceMesh):
@@ -331,7 +333,7 @@ def _apply_tp(model: GPT, tp_mesh: DeviceMesh):
         block.attn.n_head = block.attn.n_head // tp_mesh.size()
 
 
-def _apply_fsdp(model: GPT, fsdp_mesh: DeviceMesh):
+def _apply_fsdp(model: GPT, fsdp_mesh: DeviceMesh, reshard_after_forward: bool = True):
     # FSDP mixed precision
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
@@ -356,6 +358,7 @@ def _apply_fsdp(model: GPT, fsdp_mesh: DeviceMesh):
             mesh=fsdp_mesh,
             shard_placement_fn=lambda param: shard_map.get(param),
             mp_policy=mp_policy,
+            reshard_after_forward=reshard_after_forward,
         )
 
     # Apply DP and FS to embedding and lm_head
