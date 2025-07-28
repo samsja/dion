@@ -164,12 +164,12 @@ class Dion(Optimizer):
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
+            epsilon=epsilon,
             algorithm="dion",
             step=0,
         )
         super().__init__(params, defaults)
 
-        self._epsilon = torch.tensor(epsilon)
         self._power_iters = power_iters
         self._oversample = oversample
         self._rng = None
@@ -223,6 +223,7 @@ class Dion(Optimizer):
             beta1 = torch.tensor(group["beta1"])
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
+            epsilon = torch.tensor(group["epsilon"])
 
             for param in group["params"]:
                 if param.grad is None:
@@ -269,7 +270,7 @@ class Dion(Optimizer):
                             lr=lr,
                             mu=mu,
                             weight_decay=weight_decay,
-                            epsilon=self._epsilon,
+                            epsilon=epsilon,
                             transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
                             oversample=self._oversample,
@@ -298,7 +299,7 @@ class Dion(Optimizer):
                             lr=lr,
                             mu=mu,
                             weight_decay=weight_decay,
-                            epsilon=self._epsilon,
+                            epsilon=epsilon,
                             transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
                             oversample=self._oversample,
@@ -323,7 +324,7 @@ class Dion(Optimizer):
                         beta2=beta2,
                         weight_decay=weight_decay,
                         step=step,
-                        epsilon=self._epsilon,
+                        epsilon=epsilon,
                     )
 
                 elif algo == "lion":
@@ -584,7 +585,7 @@ class Dion(Optimizer):
             )
 
 
-@torch.compile(dynamic=True)
+@torch.compile()
 def dion_update(
     X: Tensor,  # Model weights (modified in place)
     G: Tensor,  # Gradient
@@ -750,8 +751,7 @@ def fix_all_zero_or_nan(
     return P, Q
 
 
-# TODO see if we can get torch.compile to work on this entire function
-# TODO check for alternative to addmm_(), which does not work for DTensor
+@torch.compile()
 def dion_update_dtensor(
     X: DTensor,  # Model weights (modified in place)
     G: DTensor,  # Gradient
@@ -818,7 +818,6 @@ def dion_update_dtensor(
     return Q.to(Q_init_dtype)
 
 
-@torch.compile(dynamic=True)
 def power_iteration_dtensor(
     B: DTensor,
     Q_init: DTensor,
@@ -967,7 +966,6 @@ def generate_random_sketch_dtensor(
         S_placements[inner_shard_mesh_dim] = Shard(1)
 
     # DTensor RNG should automatically produce identical results across DP replicas
-    # TODO look into why DTensor random uses .item() and causes graph break in compile
     S = dtensor_randn(
         (k, m),
         device_mesh=P.device_mesh,
