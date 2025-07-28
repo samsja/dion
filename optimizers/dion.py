@@ -20,9 +20,9 @@ except ImportError:
 
 
 @dataclass
-class DionParamState:
+class DionParamConfig:
     """
-    Per-parameter state for Dion optimizer.
+    Per-parameter configuration for Dion optimizer.
     """
 
     # Dimensions of the tensor that is sharded
@@ -176,7 +176,7 @@ class Dion(Optimizer):
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
-        self._dion_state: Dict[Tensor, DionParamState] = {}
+        self._param_config: Dict[Tensor, DionParamConfig] = {}
 
         self._replicate_mesh = replicate_mesh
         self._outer_shard_mesh = outer_shard_mesh
@@ -229,13 +229,13 @@ class Dion(Optimizer):
                     continue
 
                 state = self.state[param]
-                dion_state = self._get_dion_state(param)
+                param_config = self._get_dion_param_config(param)
 
                 # Dion is intended to be used without gradient sync over the replicated data-parallel world
                 # For each parameter, we either all-reduce its gradient or compressed PQ states
                 # Except when replicate_mesh_grad_sync is False, in which case we assume that
                 # gradients are already synchronized before the optimizer step is called.
-                if self._replicate_mesh_grad_sync and not dion_state.all_reduce_PQ:
+                if self._replicate_mesh_grad_sync and not param_config.all_reduce_PQ:
                     self._all_reduce_gradient(param)
 
                 # Call the corresponding update function
@@ -250,15 +250,15 @@ class Dion(Optimizer):
 
                     Q = state["Q"]
                     all_reduce_PQ = (
-                        self._replicate_mesh_grad_sync and dion_state.all_reduce_PQ
+                        self._replicate_mesh_grad_sync and param_config.all_reduce_PQ
                     )
 
                     # Dion update for DTensor parameters
                     if isinstance(param, DTensor):
                         # Unshard Q along the inner sharding dimension
-                        if dion_state.Q_inner_unsharded_placements is not None:
+                        if param_config.Q_inner_unsharded_placements is not None:
                             Q = Q.redistribute(
-                                placements=dion_state.Q_inner_unsharded_placements,
+                                placements=param_config.Q_inner_unsharded_placements,
                                 async_op=True,
                             )
                         Q_new = dion_update_dtensor(
@@ -270,17 +270,17 @@ class Dion(Optimizer):
                             mu=mu,
                             weight_decay=weight_decay,
                             epsilon=self._epsilon,
-                            transpose=dion_state.is_transposed,
+                            transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
                             oversample=self._oversample,
                             all_reduce_PQ=all_reduce_PQ,
                             replicate_mesh=self._replicate_mesh,
-                            inner_shard_mesh_dim=dion_state.inner_shard_mesh_dim,
+                            inner_shard_mesh_dim=param_config.inner_shard_mesh_dim,
                         )
                         # Shard new Q along the inner sharding dimension
-                        if dion_state.Q_sharded_placements is not None:
+                        if param_config.Q_sharded_placements is not None:
                             Q_new = Q_new.redistribute(
-                                placements=dion_state.Q_sharded_placements,
+                                placements=param_config.Q_sharded_placements,
                             )
 
                     # Dion update for non-DTensor parameters
@@ -299,7 +299,7 @@ class Dion(Optimizer):
                             mu=mu,
                             weight_decay=weight_decay,
                             epsilon=self._epsilon,
-                            transpose=dion_state.is_transposed,
+                            transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
                             oversample=self._oversample,
                             all_reduce_PQ=all_reduce_PQ,
@@ -367,15 +367,15 @@ class Dion(Optimizer):
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
             )
 
-    def _get_dion_state(self, x: Tensor) -> DionParamState:
+    def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
         """
-        Get the Dion-specific parameter state info for a given tensor.
-        If the state is not already initialized, it will be created.
+        Get the Dion-specific parameter configuration for a given tensor.
+        If the configuration is not already initialized, it will be created.
         Lazy initialization is necessary because PyTorch allows new parameters
         to be added to the optimizer after it has been created.
         """
-        if x in self._dion_state:
-            return self._dion_state[x]
+        if x in self._param_config:
+            return self._param_config[x]
 
         if x.ndim > 2:
             raise NotImplementedError(
@@ -398,13 +398,13 @@ class Dion(Optimizer):
             )
 
         # State is initialized for both matrix and scalar parameters
-        state = DionParamState()
+        config = DionParamConfig()
 
         # By default, we transpose matrices so that dim0 >= dim1
         # This can change depending on sharding
         if x.ndim == 2:
             m, n = x.shape
-            state.is_transposed = m < n
+            config.is_transposed = m < n
 
         # Detect sharding dimensions for DTensor
         if isinstance(x, DTensor) and x.ndim == 2:
@@ -441,12 +441,12 @@ class Dion(Optimizer):
                 # Check if it matches the outer or inner shard ranks
                 outer_sharded, inner_sharded = False, False
                 if mesh_dim_ranks == self._outer_shard_ranks:
-                    state.outer_shard_tensor_dim = tensor_dim
-                    state.outer_shard_mesh_dim = mesh_dim
+                    config.outer_shard_tensor_dim = tensor_dim
+                    config.outer_shard_mesh_dim = mesh_dim
                     outer_sharded = True
                 if mesh_dim_ranks == self._inner_shard_ranks:
-                    state.inner_shard_tensor_dim = tensor_dim
-                    state.inner_shard_mesh_dim = mesh_dim
+                    config.inner_shard_tensor_dim = tensor_dim
+                    config.inner_shard_mesh_dim = mesh_dim
                     inner_sharded = True
 
                 # Check for double sharding on same mesh dimension
@@ -469,14 +469,14 @@ class Dion(Optimizer):
 
             # Set transpose so that orthogonalization happens over the inner sharding dimension
             # Standard Dion orthogonalizes over tensor dimension 0
-            if state.inner_shard_tensor_dim == 0 or state.outer_shard_tensor_dim == 1:
-                state.is_transposed = False
+            if config.inner_shard_tensor_dim == 0 or config.outer_shard_tensor_dim == 1:
+                config.is_transposed = False
             # Transposed Dion orthogonalizes over tensor dimension 1
-            if state.outer_shard_tensor_dim == 0 or state.inner_shard_tensor_dim == 1:
-                state.is_transposed = True
+            if config.outer_shard_tensor_dim == 0 or config.inner_shard_tensor_dim == 1:
+                config.is_transposed = True
 
-        self._dion_state[x] = state
-        return state
+        self._param_config[x] = config
+        return config
 
     def _init_opt_state_momentum(self, param: Tensor, state: Dict[str, Any]):
         # Create the momentum buffer
@@ -511,7 +511,7 @@ class Dion(Optimizer):
                 f"For scalar parameters, set 'algorithm' to 'lion' or 'adamw' when creating param group."
             )
 
-        dion_state = self._get_dion_state(param)
+        param_config = self._get_dion_param_config(param)
         self._init_opt_state_momentum(param, state)
 
         # Compute the low-rank factor r
@@ -519,12 +519,12 @@ class Dion(Optimizer):
         r = rank_fraction * min(m, n)
         r = rank_multiple_of * math.ceil(r / rank_multiple_of)
         r = min(r, m, n)
-        Q_shape = (m, r) if dion_state.is_transposed else (n, r)
+        Q_shape = (m, r) if param_config.is_transposed else (n, r)
 
         # Set all-reduce PQ based on if it saves communication cost
         # Otherwise we will all-reduce the gradient matrix instead
         if rank_fraction < 1 and (m + n) * r < m * n:
-            dion_state.all_reduce_PQ = True
+            param_config.all_reduce_PQ = True
 
         # Get dtype for Q
         if self._mixed_precision_config.Q_dtype is not None:
@@ -536,26 +536,26 @@ class Dion(Optimizer):
             # Directly construct Q as DTensor
             # Shard(0) on outer sharding mesh and Shard(1) on inner sharding mesh
             placements = [Replicate() for _ in range(param.device_mesh.ndim)]
-            if dion_state.outer_shard_mesh_dim is not None:
-                placements[dion_state.outer_shard_mesh_dim] = Shard(0)
-            if dion_state.inner_shard_mesh_dim is not None:
-                placements[dion_state.inner_shard_mesh_dim] = Shard(1)
-            dion_state.Q_sharded_placements = tuple(placements)
+            if param_config.outer_shard_mesh_dim is not None:
+                placements[param_config.outer_shard_mesh_dim] = Shard(0)
+            if param_config.inner_shard_mesh_dim is not None:
+                placements[param_config.inner_shard_mesh_dim] = Shard(1)
+            param_config.Q_sharded_placements = tuple(placements)
 
             # Q is unsharded along the inner sharding dimension only
-            if dion_state.inner_shard_mesh_dim is not None:
-                placements[dion_state.inner_shard_mesh_dim] = Replicate()
-                dion_state.Q_inner_unsharded_placements = tuple(placements)
+            if param_config.inner_shard_mesh_dim is not None:
+                placements[param_config.inner_shard_mesh_dim] = Replicate()
+                param_config.Q_inner_unsharded_placements = tuple(placements)
             else:
                 # No inner sharding, so placements are the same as Q_sharded_placements
-                dion_state.Q_inner_unsharded_placements = None
+                param_config.Q_inner_unsharded_placements = None
 
             # DTensor RNG should automatically produce identical results across DP replicas
             Q = dtensor_randn(
                 Q_shape,
                 device_mesh=param.device_mesh,
                 dtype=Q_dtype,
-                placements=dion_state.Q_sharded_placements,
+                placements=param_config.Q_sharded_placements,
             )
 
         else:

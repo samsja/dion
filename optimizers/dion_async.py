@@ -188,7 +188,7 @@ class Dion(Optimizer):
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
-        self._dion_config: Dict[Tensor, DionParamConfig] = {}
+        self._param_config: Dict[Tensor, DionParamConfig] = {}
 
         self._replicate_mesh = replicate_mesh
         self._outer_shard_mesh = outer_shard_mesh
@@ -310,7 +310,7 @@ class Dion(Optimizer):
                 states = [self._get_or_initialize_state(p, group) for p in params]
                 momentums = [s["momentum"] for s in states]
                 Qs = [s["Q"] for s in states]
-                dion_config = self._get_dion_config(params[0])
+                param_config = self._get_dion_param_config(params[0])
 
                 if not use_dtensor:
                     params = to_local(params)
@@ -328,7 +328,7 @@ class Dion(Optimizer):
                         mu=mu,
                         weight_decay=weight_decay,
                         epsilon=epsilon,
-                        dion_config=dion_config,
+                        param_config=param_config,
                         replicate_mesh=all_reduce_mesh,
                         oversample=self._oversample,
                     )
@@ -445,15 +445,15 @@ class Dion(Optimizer):
                 raise ValueError(f"Unknown algorithm: {algo}")
         return state
 
-    def _get_dion_config(self, x: Tensor) -> DionParamConfig:
+    def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
         """
-        Get the Dion-specific parameter config info for a given tensor.
-        If the config is not already initialized, it will be created.
+        Get the Dion-specific parameter configuration for a given tensor.
+        If the configuration is not already initialized, it will be created.
         Lazy initialization is necessary because PyTorch allows new parameters
         to be added to the optimizer after it has been created.
         """
-        if x in self._dion_config:
-            return self._dion_config[x]
+        if x in self._param_config:
+            return self._param_config[x]
 
         if x.ndim > 2:
             raise NotImplementedError(
@@ -476,13 +476,13 @@ class Dion(Optimizer):
             )
 
         # State is initialized for both matrix and scalar parameters
-        state = DionParamConfig()
+        config = DionParamConfig()
 
         # By default, we transpose matrices so that dim0 >= dim1
         # This can change depending on sharding
         if x.ndim == 2:
             m, n = x.shape
-            state.is_transposed = m < n
+            config.is_transposed = m < n
 
         # Detect sharding dimensions for DTensor
         if isinstance(x, DTensor) and x.ndim == 2:
@@ -519,12 +519,12 @@ class Dion(Optimizer):
                 # Check if it matches the outer or inner shard ranks
                 outer_sharded, inner_sharded = False, False
                 if mesh_dim_ranks == self._outer_shard_ranks:
-                    state.outer_shard_tensor_dim = tensor_dim
-                    state.outer_shard_mesh_dim = mesh_dim
+                    config.outer_shard_tensor_dim = tensor_dim
+                    config.outer_shard_mesh_dim = mesh_dim
                     outer_sharded = True
                 if mesh_dim_ranks == self._inner_shard_ranks:
-                    state.inner_shard_tensor_dim = tensor_dim
-                    state.inner_shard_mesh_dim = mesh_dim
+                    config.inner_shard_tensor_dim = tensor_dim
+                    config.inner_shard_mesh_dim = mesh_dim
                     inner_sharded = True
 
                 # Check for double sharding on same mesh dimension
@@ -547,14 +547,14 @@ class Dion(Optimizer):
 
             # Set transpose so that orthogonalization happens over the inner sharding dimension
             # Standard Dion orthogonalizes over tensor dimension 0
-            if state.inner_shard_tensor_dim == 0 or state.outer_shard_tensor_dim == 1:
-                state.is_transposed = False
+            if config.inner_shard_tensor_dim == 0 or config.outer_shard_tensor_dim == 1:
+                config.is_transposed = False
             # Transposed Dion orthogonalizes over tensor dimension 1
-            if state.outer_shard_tensor_dim == 0 or state.inner_shard_tensor_dim == 1:
-                state.is_transposed = True
+            if config.outer_shard_tensor_dim == 0 or config.inner_shard_tensor_dim == 1:
+                config.is_transposed = True
 
-        self._dion_config[x] = state
-        return state
+        self._param_config[x] = config
+        return config
 
     def _init_opt_state_momentum(self, param: Tensor, state: Dict[str, Any]):
         # Create the momentum buffer
@@ -589,7 +589,7 @@ class Dion(Optimizer):
                 f"For scalar parameters, set 'algorithm' to 'lion' or 'adamw' when creating param group."
             )
 
-        dion_config = self._get_dion_config(param)
+        param_config = self._get_dion_param_config(param)
         self._init_opt_state_momentum(param, state)
 
         # Compute the low-rank factor r
@@ -597,12 +597,12 @@ class Dion(Optimizer):
         r = rank_fraction * min(m, n)
         r = rank_multiple_of * math.ceil(r / rank_multiple_of)
         r = min(r, m, n)
-        Q_shape = (m, r) if dion_config.is_transposed else (n, r)
+        Q_shape = (m, r) if param_config.is_transposed else (n, r)
 
         # Set compressed_all_reduce based on if it saves communication cost
         # Otherwise we will all-reduce the gradient matrix instead
         if rank_fraction < 1 and (m + n) * r < m * n:
-            dion_config.compressed_all_reduce = True
+            param_config.compressed_all_reduce = True
 
         # Get dtype for Q
         if self._mixed_precision_config.Q_dtype is not None:
@@ -614,26 +614,26 @@ class Dion(Optimizer):
             # Directly construct Q as DTensor
             # Shard(0) on outer sharding mesh and Shard(1) on inner sharding mesh
             placements = [Replicate() for _ in range(param.device_mesh.ndim)]
-            if dion_config.outer_shard_mesh_dim is not None:
-                placements[dion_config.outer_shard_mesh_dim] = Shard(0)
-            if dion_config.inner_shard_mesh_dim is not None:
-                placements[dion_config.inner_shard_mesh_dim] = Shard(1)
-            dion_config.Q_sharded_placements = tuple(placements)
+            if param_config.outer_shard_mesh_dim is not None:
+                placements[param_config.outer_shard_mesh_dim] = Shard(0)
+            if param_config.inner_shard_mesh_dim is not None:
+                placements[param_config.inner_shard_mesh_dim] = Shard(1)
+            param_config.Q_sharded_placements = tuple(placements)
 
             # Q is unsharded along the inner sharding dimension only
-            if dion_config.inner_shard_mesh_dim is not None:
-                placements[dion_config.inner_shard_mesh_dim] = Replicate()
-                dion_config.Q_inner_unsharded_placements = tuple(placements)
+            if param_config.inner_shard_mesh_dim is not None:
+                placements[param_config.inner_shard_mesh_dim] = Replicate()
+                param_config.Q_inner_unsharded_placements = tuple(placements)
             else:
                 # No inner sharding, so placements are the same as Q_sharded_placements
-                dion_config.Q_inner_unsharded_placements = None
+                param_config.Q_inner_unsharded_placements = None
 
             # DTensor RNG should automatically produce identical results across DP replicas
             Q = dtensor_randn(
                 Q_shape,
                 device_mesh=param.device_mesh,
                 dtype=Q_dtype,
-                placements=dion_config.Q_sharded_placements,
+                placements=param_config.Q_sharded_placements,
             )
 
         else:
@@ -671,7 +671,7 @@ def dion_update_ddp(
     mu: Tensor,  # Momentum factor (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: float,
-    dion_config: DionParamConfig,  # shared for all params in batch
+    param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
@@ -682,10 +682,10 @@ def dion_update_ddp(
     Batch size should equal the DDP world size. Each device will
     orthogonalize one full matrix in the batch.
     """
-    assert dion_config.outer_shard_mesh_dim is None
-    assert dion_config.outer_shard_tensor_dim is None
-    assert dion_config.inner_shard_mesh_dim is None
-    assert dion_config.inner_shard_tensor_dim is None
+    assert param_config.outer_shard_mesh_dim is None
+    assert param_config.outer_shard_tensor_dim is None
+    assert param_config.inner_shard_mesh_dim is None
+    assert param_config.inner_shard_tensor_dim is None
 
     # Get rank and world size
     if isinstance(replicate_mesh, DeviceMesh):
@@ -704,7 +704,7 @@ def dion_update_ddp(
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if not param_config.compressed_all_reduce and replicate_mesh is not None:
         G = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
 
@@ -717,7 +717,7 @@ def dion_update_ddp(
     # Add new gradient to momentum
     # Stack into 3D tensor of shape (batch_size, m, n) (when non-transposed)
     torch._foreach_add_(M, G)
-    if dion_config.is_transposed:
+    if param_config.is_transposed:
         M_batch = torch.stack([m.T for m in M])
     else:
         M_batch = torch.stack(M)
@@ -728,7 +728,7 @@ def dion_update_ddp(
     # Q_batch shape is (batch_size, n, r)
     P_batch = M_batch @ Q_batch
 
-    if dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if param_config.compressed_all_reduce and replicate_mesh is not None:
         # Synchronize P across all DDP ranks by reduce-scatter
         # Each rank will orthogonalize one full matrix in the batch
         P_single = funcol.reduce_scatter_tensor(
@@ -783,7 +783,7 @@ def dion_update_ddp(
     R_batch = M_batch.mT @ P_batch
 
     # Synchronize R across all DDP ranks by all-reduce
-    if dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if param_config.compressed_all_reduce and replicate_mesh is not None:
         R_batch = funcol.all_reduce(
             R_batch,
             reduceOp="avg",
@@ -797,7 +797,7 @@ def dion_update_ddp(
     # Error feedback update
     # M = M - (1 - mu) * (P @ R.T)
     foreach_baddbmm_(
-        M, P_batch, R_batch, alpha=-(1 - mu), transpose=dion_config.is_transposed
+        M, P_batch, R_batch, alpha=-(1 - mu), transpose=param_config.is_transposed
     )
 
     # Column normalize R to get new Q
@@ -814,7 +814,7 @@ def dion_update_ddp(
     # Apply weight update
     # X = X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=dion_config.is_transposed
+        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
     )
 
     # Update Q in place
@@ -831,7 +831,7 @@ def dion_update_fsdp(
     mu: Tensor,  # Momentum factor (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: float,
-    dion_config: DionParamConfig,  # shared for all params in batch
+    param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Optional[DeviceMesh] = None,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
@@ -842,13 +842,13 @@ def dion_update_fsdp(
     Batch size should equal the outer shard mesh size. Each device along the
     outer shard mesh dimension will orthogonalize one full matrix in the batch.
     """
-    assert dion_config.inner_shard_mesh_dim is None
-    assert dion_config.inner_shard_tensor_dim is None
+    assert param_config.inner_shard_mesh_dim is None
+    assert param_config.inner_shard_tensor_dim is None
 
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if not param_config.compressed_all_reduce and replicate_mesh is not None:
         G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
         G = dtensor_from_local(G_local, ref=G[0])
@@ -862,7 +862,7 @@ def dion_update_fsdp(
     # Add new gradient to momentum
     # Stack into 3D tensor of shape (batch_size, m, n/outer) (when non-transposed)
     torch._foreach_add_(M, G)
-    if dion_config.is_transposed:
+    if param_config.is_transposed:
         M_batch = torch.stack([m.T for m in M])
     else:
         M_batch = torch.stack(M)
@@ -883,9 +883,9 @@ def dion_update_fsdp(
     # If compressed_all_reduce is True, also average over replicate mesh
     P_local = reduce_scatter_partial_tensor(
         P_batch,
-        partial_mesh_dim=dion_config.outer_shard_mesh_dim,
+        partial_mesh_dim=param_config.outer_shard_mesh_dim,
         scatter_dim=0,  # dim 0 = batch
-        replicate_mesh=replicate_mesh if dion_config.compressed_all_reduce else None,
+        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -925,7 +925,7 @@ def dion_update_fsdp(
     R_batch = M_batch.mT @ P_batch
 
     # All reduce R to average over replicate mesh
-    if dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if param_config.compressed_all_reduce and replicate_mesh is not None:
         # The contracting dimension of R = M.mT @ P isn't sharded
         # There should not be any partial placements
         assert not any(p.is_partial() for p in R_batch.placements)
@@ -944,13 +944,13 @@ def dion_update_fsdp(
     # Error feedback update
     # M = M - (1 - mu) * (P @ R.T)
     foreach_baddbmm_(
-        M, P_batch, R_batch, alpha=-(1 - mu), transpose=dion_config.is_transposed
+        M, P_batch, R_batch, alpha=-(1 - mu), transpose=param_config.is_transposed
     )
 
     # Column normalize R to get new Q
-    if dion_config.outer_shard_mesh_dim is not None:
+    if param_config.outer_shard_mesh_dim is not None:
         assert isinstance(R_batch, DTensor)
-        assert R_batch.placements[dion_config.outer_shard_mesh_dim].is_shard()
+        assert R_batch.placements[param_config.outer_shard_mesh_dim].is_shard()
 
         # Compute per-shard squared norm and sum across shards
         R_local = R_batch.to_local()
@@ -958,7 +958,7 @@ def dion_update_fsdp(
         R_norm_sq = funcol.all_reduce(
             R_norm_sq,
             reduceOp="sum",
-            group=(R_batch.device_mesh, dion_config.outer_shard_mesh_dim),
+            group=(R_batch.device_mesh, param_config.outer_shard_mesh_dim),
         )
         yield
 
@@ -981,7 +981,7 @@ def dion_update_fsdp(
     # Apply weight update
     # X = X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=dion_config.is_transposed
+        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
     )
 
     # Update Q in place
@@ -998,7 +998,7 @@ def dion_update_fsdp_tp(
     mu: Tensor,  # Momentum factor (scalar tensor)
     weight_decay: Tensor,  # Weight decay (scalar tensor)
     epsilon: float,
-    dion_config: DionParamConfig,  # shared for all params in batch
+    param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Optional[DeviceMesh] = None,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
@@ -1013,18 +1013,18 @@ def dion_update_fsdp_tp(
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not dion_config.compressed_all_reduce and replicate_mesh is not None:
+    if not param_config.compressed_all_reduce and replicate_mesh is not None:
         G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
         G = dtensor_from_local(G_local, ref=G[0])
 
     # Unshard Q along the inner sharding dimension
-    if dion_config.Q_inner_unsharded_placements is not None:
+    if param_config.Q_inner_unsharded_placements is not None:
         # Sharded Q has shape (n/outer, r/inner)
         # Unsharded Q has shape (n/outer, r)
         Q = [
             q.redistribute(
-                placements=dion_config.Q_inner_unsharded_placements,
+                placements=param_config.Q_inner_unsharded_placements,
                 async_op=True,
             )
             for q in Q
@@ -1040,7 +1040,7 @@ def dion_update_fsdp_tp(
     # Add new gradient to momentum and stack into 3D batch
     # M_batch shape is (batch_size, m/inner, n/outer) (when non-transposed)
     torch._foreach_add_(M, G)
-    if dion_config.is_transposed:
+    if param_config.is_transposed:
         M_batch = torch.stack([m.T for m in M])
     else:
         M_batch = torch.stack(M)
@@ -1056,8 +1056,8 @@ def dion_update_fsdp_tp(
     P_placements = [Replicate() if p.is_partial() else p for p in P_batch.placements]
     P_local = all_reduce_partial_tensor(
         P_batch,
-        partial_mesh_dim=dion_config.outer_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if dion_config.compressed_all_reduce else None,
+        partial_mesh_dim=param_config.outer_shard_mesh_dim,
+        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -1072,8 +1072,8 @@ def dion_update_fsdp_tp(
     # Shard along dim 0 = batch
     _, m, r = P_batch.shape  # this is unsharded tensor shape
     batch_sharded_placements = [Replicate() for _ in P_placements]
-    if dion_config.inner_shard_mesh_dim is not None:
-        batch_sharded_placements[dion_config.inner_shard_mesh_dim] = Shard(0)
+    if param_config.inner_shard_mesh_dim is not None:
+        batch_sharded_placements[param_config.inner_shard_mesh_dim] = Shard(0)
 
     # Standard QR is faster if matrix is square or wide
     if m <= r:
@@ -1098,7 +1098,7 @@ def dion_update_fsdp_tp(
         # P_batch shape is (batch_size, m/inner, r)
         # S_batch shape is (batch_size, k, m/inner)
         S_batch = generate_random_sketch_matrix(
-            P_batch, oversample, shard_mesh_dim=dion_config.inner_shard_mesh_dim
+            P_batch, oversample, shard_mesh_dim=param_config.inner_shard_mesh_dim
         )
 
         # SP_batch shape is (batch_size, k, r)
@@ -1154,8 +1154,8 @@ def dion_update_fsdp_tp(
     R_placements = [Replicate() if p.is_partial() else p for p in R_batch.placements]
     R_local = all_reduce_partial_tensor(
         R_batch,
-        partial_mesh_dim=dion_config.inner_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if dion_config.compressed_all_reduce else None,
+        partial_mesh_dim=param_config.inner_shard_mesh_dim,
+        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -1171,13 +1171,13 @@ def dion_update_fsdp_tp(
     # Error feedback update
     # M = M - (1 - mu) * (P @ R.T)
     foreach_baddbmm_(
-        M, P_batch, R_batch, alpha=-(1 - mu), transpose=dion_config.is_transposed
+        M, P_batch, R_batch, alpha=-(1 - mu), transpose=param_config.is_transposed
     )
 
     # Column normalize R to get new Q
-    if dion_config.outer_shard_mesh_dim is not None:
+    if param_config.outer_shard_mesh_dim is not None:
         assert isinstance(R_batch, DTensor)
-        assert R_batch.placements[dion_config.outer_shard_mesh_dim].is_shard()
+        assert R_batch.placements[param_config.outer_shard_mesh_dim].is_shard()
 
         # Compute per-shard squared norm and sum across shards
         R_local = R_batch.to_local()
@@ -1185,7 +1185,7 @@ def dion_update_fsdp_tp(
         R_norm_sq = funcol.all_reduce(
             R_norm_sq,
             reduceOp="sum",
-            group=(R_batch.device_mesh, dion_config.outer_shard_mesh_dim),
+            group=(R_batch.device_mesh, param_config.outer_shard_mesh_dim),
         )
         yield
 
@@ -1208,16 +1208,16 @@ def dion_update_fsdp_tp(
     # Apply weight update
     # X = X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=dion_config.is_transposed
+        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
     )
 
     # Re-shard and update Q in place
     Q_new = Q_batch.to(Q_init_dtype).split(1, dim=0)
-    if dion_config.Q_sharded_placements is not None:
+    if param_config.Q_sharded_placements is not None:
         # Sharded Q has shape (n/outer, r/inner)
         # Unsharded Q has shape (n/outer, r)
         Q_new = [
-            q.redistribute(placements=dion_config.Q_sharded_placements) for q in Q_new
+            q.redistribute(placements=param_config.Q_sharded_placements) for q in Q_new
         ]
     torch._foreach_copy_(Q, Q_new)
 
