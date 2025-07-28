@@ -15,14 +15,42 @@ def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]
     return [t.to_local() if isinstance(t, DTensor) else t for t in tensor]
 
 
+def dtensor_from_local(
+    tensor: Union[Tensor, List[Tensor]], ref: Tensor
+) -> Union[DTensor, List[DTensor]]:
+    """
+    Convert a single local Tensor or list of local Tensors to DTensor.
+    The reference tensor's device mesh and placements are used to create the DTensor.
+    if the reference tensor is not a DTensor, we return the input unmodified.
+    """
+    if not isinstance(ref, DTensor):
+        assert isinstance(ref, Tensor)
+        return tensor
+
+    device_mesh = ref.device_mesh
+    placements = ref.placements
+
+    # If we have a single tensor
+    if isinstance(tensor, Tensor):
+        assert not isinstance(tensor, DTensor)
+        return DTensor.from_local(
+            tensor, device_mesh=device_mesh, placements=placements
+        )
+
+    # We have a list of tensors
+    assert not isinstance(tensor[0], DTensor)
+    return [
+        DTensor.from_local(t, device_mesh=device_mesh, placements=placements)
+        for t in tensor
+    ]
+
+
 def create_param_batches(
-    params: List[Tensor], batch_size: int, pad: bool = True
+    params: List[Tensor], batch_size: int
 ) -> Generator[List[Tensor], None, None]:
     """
     Batch parameters into groups of size `batch_size`.
     Tensors in each batch will have identical shape, sharding, and dtype.
-    If pad is True, batches will be padded with empty tensors to ensure uniform size.
-    If pad is False, the last batch may be smaller than `batch_size`.
     """
     # Group parameters by shape, sharding, and dtype
     groups = defaultdict(list)
@@ -34,9 +62,18 @@ def create_param_batches(
     for group in groups.values():
         for i in range(0, len(group), batch_size):
             batch = group[i : i + batch_size]
-            while pad and len(batch) < batch_size:
-                batch.append(torch.empty_like(batch[0]))
             yield batch
+
+
+def pad_batch(batch: List[Tensor], batch_size: int) -> List[Tensor]:
+    """
+    Insert dummy tensors so the batch has exactly `batch_size` elements.
+    """
+    assert len(batch) > 0
+    assert len(batch) <= batch_size
+    while len(batch) < batch_size:
+        batch.append(torch.empty_like(batch[0]))
+    return batch
 
 
 class AsyncTask:

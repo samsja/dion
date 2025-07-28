@@ -14,10 +14,11 @@ from .opt_utils import (
     AsyncRuntime,
     to_local,
     create_param_batches,
+    pad_batch,
 )
 from .scalar_opts import (
-    lion_update_foreach_async,
-    adamw_update_foreach_async,
+    lion_update_foreach,
+    adamw_update_foreach,
 )
 
 
@@ -170,6 +171,10 @@ class Muon(Optimizer):
         return loss
 
     def _get_or_initialize_state(self, param: Tensor, algo: str) -> dict:
+        """
+        Get optimizer state for the given parameter tensor,
+        or lazy-initialize it if it doesn't exist.
+        """
         state = self.state[param]
         if not state:
             state["momentum"] = torch.zeros_like(param)
@@ -190,7 +195,7 @@ class Muon(Optimizer):
             assert group["algorithm"] == algo_name
             assert all(
                 p.ndim >= 2 for p in group["params"]
-            ), "Muon optimizer only supports 2D parameters."
+            ), "Muon optimizer only supports matrix parameters."
 
             group_params = [p for p in group["params"] if p.grad is not None]
             if not group_params:
@@ -207,7 +212,7 @@ class Muon(Optimizer):
 
             # Create batches of parameters of size self._world_size
             for params in create_param_batches(
-                group_params, batch_size=self._world_size, pad=True
+                group_params, batch_size=self._world_size
             ):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
@@ -249,9 +254,9 @@ class Muon(Optimizer):
 
                 yield AsyncTask(
                     muon_update_batch_async(
-                        X=params,
-                        G=gradients,
-                        M=momentums,
+                        X=pad_batch(params, self._world_size),
+                        G=pad_batch(gradients, self._world_size),
+                        M=pad_batch(momentums, self._world_size),
                         lr=lr,
                         momentum=mu,
                         weight_decay=weight_decay,
@@ -477,6 +482,41 @@ def muon_update_batch_async(
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
     )
+
+
+def adamw_update_foreach_async(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    V: List[Tensor],  # Variance buffer (modified in place)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    beta1: Tensor,  # Beta 1 (scalar tensor)
+    beta2: Tensor,  # Beta 2 (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    step: int,
+    epsilon: float,
+) -> Generator[None, None, None]:
+    """
+    Async wrapper around foreach AdamW update.
+    """
+    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
+    yield
+
+
+def lion_update_foreach_async(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    beta1: Tensor,  # Beta 1 (scalar tensor)
+    beta2: Tensor,  # Beta 2 (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+) -> Generator[None, None, None]:
+    """
+    Async wrapper around foreach Lion update.
+    """
+    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
+    yield
 
 
 @torch.compile()

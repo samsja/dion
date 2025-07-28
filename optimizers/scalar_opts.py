@@ -1,6 +1,6 @@
 import torch
 from torch import Tensor
-from typing import List, Generator
+from typing import List
 
 
 @torch.compile()
@@ -177,32 +177,3 @@ def lion_update_foreach(
     # Weight update
     # X = X - lr * U
     torch._foreach_add_(X, U, alpha=-lr)
-
-
-def adamw_update_foreach_async(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
-    V: List[Tensor],  # Variance buffer (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    beta1: Tensor,  # Beta 1 (scalar tensor)
-    beta2: Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
-    step: int,
-    epsilon: float,
-) -> Generator[None, None, None]:
-    adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
-    yield
-
-
-def lion_update_foreach_async(
-    X: List[Tensor],  # Model weights (modified in place)
-    G: List[Tensor],  # Gradient
-    M: List[Tensor],  # Momentum buffer (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    beta1: Tensor,  # Beta 1 (scalar tensor)
-    beta2: Tensor,  # Beta 2 (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
-) -> Generator[None, None, None]:
-    lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)
-    yield

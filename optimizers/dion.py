@@ -256,7 +256,7 @@ class Dion(Optimizer):
                     # Dion update for DTensor parameters
                     if isinstance(param, DTensor):
                         # Unshard Q along the inner sharding dimension
-                        if self._inner_shard_mesh is not None:
+                        if dion_state.Q_inner_unsharded_placements is not None:
                             Q = Q.redistribute(
                                 placements=dion_state.Q_inner_unsharded_placements,
                                 async_op=True,
@@ -278,7 +278,7 @@ class Dion(Optimizer):
                             inner_shard_mesh_dim=dion_state.inner_shard_mesh_dim,
                         )
                         # Shard new Q along the inner sharding dimension
-                        if self._inner_shard_mesh is not None:
+                        if dion_state.Q_sharded_placements is not None:
                             Q_new = Q_new.redistribute(
                                 placements=dion_state.Q_sharded_placements,
                             )
@@ -545,7 +545,10 @@ class Dion(Optimizer):
             # Q is unsharded along the inner sharding dimension only
             if dion_state.inner_shard_mesh_dim is not None:
                 placements[dion_state.inner_shard_mesh_dim] = Replicate()
-            dion_state.Q_inner_unsharded_placements = tuple(placements)
+                dion_state.Q_inner_unsharded_placements = tuple(placements)
+            else:
+                # No inner sharding, so placements are the same as Q_sharded_placements
+                dion_state.Q_inner_unsharded_placements = None
 
             # DTensor RNG should automatically produce identical results across DP replicas
             Q = dtensor_randn(
@@ -762,7 +765,7 @@ def dion_update_dtensor(
     power_iters: int,
     oversample: float = 1.25,
     all_reduce_PQ: bool = True,
-    replicate_mesh: Optional[Tuple[int]] = None,
+    replicate_mesh: Optional[DeviceMesh] = None,
     inner_shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
     """
