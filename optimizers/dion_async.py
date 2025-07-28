@@ -23,7 +23,6 @@ from .scalar_opts import (
     adamw_update_foreach,
     lion_update_foreach,
 )
-from .dion import fix_all_zero_or_nan
 
 try:
     from torch.distributed.tensor.placement_types import _StridedShard
@@ -134,8 +133,8 @@ class Dion(Optimizer):
             raise ValueError(f"Invalid rank fraction: {rank_fraction}")
         if rank_multiple_of <= 0:
             raise ValueError(f"Invalid rank multiple of: {rank_multiple_of}")
-        if power_iters <= 0:
-            raise ValueError(f"Invalid power iterations: {power_iters}")
+        if power_iters != 1:
+            raise ValueError("Async Dion only supports power_iters=1")
 
         # Check device mesh
         if outer_shard_mesh is not None:
@@ -176,15 +175,12 @@ class Dion(Optimizer):
             beta1=betas[0],
             beta2=betas[1],
             weight_decay=weight_decay,
+            epsilon=epsilon,
             algorithm="dion",
             step=0,
         )
         super().__init__(params, defaults)
-
-        self._epsilon = torch.tensor(epsilon)
-        self._power_iters = power_iters
         self._oversample = oversample
-        self._rng = None
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
@@ -245,7 +241,7 @@ class Dion(Optimizer):
 
             # Split parameter groups by algorithm
             algo = group["algorithm"]
-            if algo == "muon":
+            if algo == "dion":
                 dion_groups.append(group)
             elif algo == "lion":
                 lion_groups.append(group)
@@ -289,9 +285,6 @@ class Dion(Optimizer):
 
         # If replicate_mesh_grad_sync is True, the optimizer needs to all-reduce gradients
         # If replicate_mesh_grad_sync is False, gradients are already synchronized
-        all_reduce_mesh = (
-            self._replicate_mesh if self._replicate_mesh_grad_sync else None
-        )
 
         for group in param_groups:
             group_params = [p for p in group["params"] if p.grad is not None]
@@ -329,7 +322,8 @@ class Dion(Optimizer):
                         weight_decay=weight_decay,
                         epsilon=epsilon,
                         param_config=param_config,
-                        replicate_mesh=all_reduce_mesh,
+                        replicate_mesh=self._replicate_mesh,
+                        replicate_mesh_grad_sync=self._replicate_mesh_grad_sync,
                         oversample=self._oversample,
                     )
                 )
@@ -673,6 +667,7 @@ def dion_update_ddp(
     epsilon: float,
     param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
+    replicate_mesh_grad_sync: bool = True,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
     """
@@ -704,7 +699,11 @@ def dion_update_ddp(
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not param_config.compressed_all_reduce and replicate_mesh is not None:
+    if (
+        replicate_mesh_grad_sync
+        and not param_config.compressed_all_reduce
+        and replicate_mesh is not None
+    ):
         G = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
 
@@ -728,7 +727,11 @@ def dion_update_ddp(
     # Q_batch shape is (batch_size, n, r)
     P_batch = M_batch @ Q_batch
 
-    if param_config.compressed_all_reduce and replicate_mesh is not None:
+    if (
+        replicate_mesh_grad_sync
+        and param_config.compressed_all_reduce
+        and replicate_mesh is not None
+    ):
         # Synchronize P across all DDP ranks by reduce-scatter
         # Each rank will orthogonalize one full matrix in the batch
         P_single = funcol.reduce_scatter_tensor(
@@ -748,7 +751,7 @@ def dion_update_ddp(
     _, m, r = P_single.shape
     if m <= r:
         P_single, _ = torch.linalg.qr(P_single.to(dtype=torch.float32))
-        P_single = P_single.to(dtype=M_dtype)
+        P_single = P_single.to(dtype=M_dtype).contiguous()
 
     # Randomized Cholesky QR
     else:
@@ -762,19 +765,23 @@ def dion_update_ddp(
 
         # Apply Cholesky QR to better orthogonalize
         PP_single = P_single.mT @ P_single
-        R_single = torch.linalg.cholesky_ex(PP_single, upper=True)
+        R_single, _ = torch.linalg.cholesky_ex(PP_single, upper=True)
         P_single = torch.linalg.solve_triangular(
             R_single, P_single, upper=True, left=False
         )
-        P_single = P_single.to(dtype=M_dtype)
+        P_single = P_single.to(dtype=M_dtype).contiguous()
 
     # All gather P_batch from the per-device single matrices
-    P_batch = funcol.all_gather_tensor(
-        P_single,
-        gather_dim=0,  # dim 0 = batch
-        group=replicate_mesh,
-    )
-    yield
+    if replicate_mesh is not None:
+        P_batch = funcol.all_gather_tensor(
+            P_single,
+            gather_dim=0,  # dim 0 = batch
+            group=replicate_mesh,
+        )
+        yield
+    else:
+        assert world_size == 1
+        P_batch = P_single  # batch size is 1
 
     # M_batch shape is (batch_size, m, n)
     # P_batch shape is (batch_size, m, r)
@@ -783,7 +790,11 @@ def dion_update_ddp(
     R_batch = M_batch.mT @ P_batch
 
     # Synchronize R across all DDP ranks by all-reduce
-    if param_config.compressed_all_reduce and replicate_mesh is not None:
+    if (
+        replicate_mesh_grad_sync
+        and param_config.compressed_all_reduce
+        and replicate_mesh is not None
+    ):
         R_batch = funcol.all_reduce(
             R_batch,
             reduceOp="avg",
@@ -807,8 +818,8 @@ def dion_update_ddp(
     torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Compute update scale factor
-    fan_out = X.size(0)
-    fan_in = X.size(1)
+    fan_out = X[0].size(0)
+    fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
     # Apply weight update
@@ -818,7 +829,7 @@ def dion_update_ddp(
     )
 
     # Update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).split(1, dim=0)
+    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
     torch._foreach_copy_(Q, Q_new)
 
 
@@ -833,6 +844,7 @@ def dion_update_fsdp(
     epsilon: float,
     param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Optional[DeviceMesh] = None,
+    replicate_mesh_grad_sync: bool = True,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
     """
@@ -848,7 +860,11 @@ def dion_update_fsdp(
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not param_config.compressed_all_reduce and replicate_mesh is not None:
+    if (
+        replicate_mesh_grad_sync
+        and not param_config.compressed_all_reduce
+        and replicate_mesh is not None
+    ):
         G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
         G = dtensor_from_local(G_local, ref=G[0])
@@ -881,11 +897,14 @@ def dion_update_fsdp(
         Shard(0) if p.is_partial() else p for p in P_batch.placements
     ]
     # If compressed_all_reduce is True, also average over replicate mesh
+    compressed_all_reduce = (
+        replicate_mesh_grad_sync and param_config.compressed_all_reduce
+    )
     P_local = reduce_scatter_partial_tensor(
         P_batch,
         partial_mesh_dim=param_config.outer_shard_mesh_dim,
         scatter_dim=0,  # dim 0 = batch
-        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
+        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -925,7 +944,7 @@ def dion_update_fsdp(
     R_batch = M_batch.mT @ P_batch
 
     # All reduce R to average over replicate mesh
-    if param_config.compressed_all_reduce and replicate_mesh is not None:
+    if compressed_all_reduce and replicate_mesh is not None:
         # The contracting dimension of R = M.mT @ P isn't sharded
         # There should not be any partial placements
         assert not any(p.is_partial() for p in R_batch.placements)
@@ -974,8 +993,8 @@ def dion_update_fsdp(
     torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Compute update scale factor
-    fan_out = X.size(0)
-    fan_in = X.size(1)
+    fan_out = X[0].size(0)
+    fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
     # Apply weight update
@@ -985,7 +1004,7 @@ def dion_update_fsdp(
     )
 
     # Update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).split(1, dim=0)
+    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
     torch._foreach_copy_(Q, Q_new)
 
 
@@ -1000,6 +1019,7 @@ def dion_update_fsdp_tp(
     epsilon: float,
     param_config: DionParamConfig,  # shared for all params in batch
     replicate_mesh: Optional[DeviceMesh] = None,
+    replicate_mesh_grad_sync: bool = True,
     oversample: float = 1.25,
 ) -> Generator[None, None, None]:
     """
@@ -1013,7 +1033,11 @@ def dion_update_fsdp_tp(
     # Special case for when compressed_all_reduce is False
     # Here we all-reduce the gradient G instead of compressed P and R matrices
     # This is more efficient when rank_fraction == 1
-    if not param_config.compressed_all_reduce and replicate_mesh is not None:
+    if (
+        replicate_mesh_grad_sync
+        and not param_config.compressed_all_reduce
+        and replicate_mesh is not None
+    ):
         G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
         yield
         G = dtensor_from_local(G_local, ref=G[0])
@@ -1053,11 +1077,14 @@ def dion_update_fsdp_tp(
 
     # All reduce P to sum over shard mesh
     # If compressed_all_reduce is True, also average over replicate mesh
+    compressed_all_reduce = (
+        replicate_mesh_grad_sync and param_config.compressed_all_reduce
+    )
     P_placements = [Replicate() if p.is_partial() else p for p in P_batch.placements]
     P_local = all_reduce_partial_tensor(
         P_batch,
         partial_mesh_dim=param_config.outer_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
+        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -1155,7 +1182,7 @@ def dion_update_fsdp_tp(
     R_local = all_reduce_partial_tensor(
         R_batch,
         partial_mesh_dim=param_config.inner_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if param_config.compressed_all_reduce else None,
+        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
         return_dtensor=False,
     )
     yield
@@ -1201,8 +1228,8 @@ def dion_update_fsdp_tp(
     torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Compute update scale factor
-    fan_out = X.size(0)
-    fan_in = X.size(1)
+    fan_out = X[0].size(0)
+    fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
     # Apply weight update
@@ -1212,7 +1239,7 @@ def dion_update_fsdp_tp(
     )
 
     # Re-shard and update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).split(1, dim=0)
+    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
     if param_config.Q_sharded_placements is not None:
         # Sharded Q has shape (n/outer, r/inner)
         # Unsharded Q has shape (n/outer, r)
@@ -1471,6 +1498,33 @@ def solve_triangular_dtensor(
     )
 
 
+def fix_all_zero_or_nan(
+    P: Tensor, Q: Tensor, Q_init: Tensor, B: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """
+    If input is all zero, P and Q will be nan or all zero.
+    We want to return the conditional expressions:
+
+        if is_all_zero:
+            P = torch.zeros_like(P)
+            Q = Q_init
+        else:
+            P = P
+            Q = Q
+
+    Here this is implemented without data-dependent control flow.
+    To avoid additional communication, we handle sharded tensors independently.
+    """
+    B_local = to_local(B)
+    is_all_zero = (B_local == 0).all(dim=(-2, -1), keepdim=True)
+    not_all_zero = ~is_all_zero
+    P_local = to_local(P).nan_to_num() * not_all_zero
+    Q_local = to_local(Q).nan_to_num() * not_all_zero + to_local(Q_init) * is_all_zero
+    P = dtensor_from_local(P_local, ref=P)
+    Q = dtensor_from_local(Q_local, ref=Q)
+    return P, Q
+
+
 def foreach_baddbmm_(
     X: List[Tensor],  # List of 2D matrices (modified in place)
     A: Tensor,  # 3D batch of matrices
@@ -1493,7 +1547,7 @@ def foreach_baddbmm_(
     else:
         update = B @ A.mT
 
-    update = update.split(1, dim=0)  # Split batch into list of tensors
+    update = update.unbind(dim=0)  # Split batch into list of tensors
     torch._foreach_add_(X, update, alpha=alpha)
 
 

@@ -19,10 +19,11 @@ from typing import Optional
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
 from optimizers.dion import Dion
-from optimizers.muon import Muon
+from optimizers.dion_async import Dion as DionAsync
 from optimizers.dion_reference import Dion as DionReference
-from optimizers.muon_reference import Muon as MuonReference
 from optimizers.dion_simple import Dion as DionSimple
+from optimizers.muon import Muon
+from optimizers.muon_reference import Muon as MuonReference
 
 
 @dataclass
@@ -308,17 +309,32 @@ def init_optimizer(
     )
 
     # Create the main optimizer
+    if device_mesh is not None:
+        replicate_mesh = device_mesh["dp"]
+        outer_shard_mesh = device_mesh["fs"]
+        inner_shard_mesh = device_mesh["tp"]
+    else:
+        assert ddp_model is not None
+        replicate_mesh = ddp_model.process_group
+        outer_shard_mesh = None
+        inner_shard_mesh = None
+
     if hp.optimizer == "dion":
-        if device_mesh is not None:
-            replicate_mesh = device_mesh["dp"]
-            outer_shard_mesh = device_mesh["fs"]
-            inner_shard_mesh = device_mesh["tp"]
-        else:
-            assert ddp_model is not None
-            replicate_mesh = ddp_model.process_group
-            outer_shard_mesh = None
-            inner_shard_mesh = None
         opt = Dion(
+            param_groups,
+            replicate_mesh=replicate_mesh,
+            outer_shard_mesh=outer_shard_mesh,
+            inner_shard_mesh=inner_shard_mesh,
+            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
+            rank_fraction=hp.rank_fraction,
+            lr=hp.lr,
+            mu=hp.mu,
+            weight_decay=hp.weight_decay,
+            oversample=hp.oversample,
+        )
+
+    elif hp.optimizer == "dion_async":
+        opt = DionAsync(
             param_groups,
             replicate_mesh=replicate_mesh,
             outer_shard_mesh=outer_shard_mesh,
@@ -334,12 +350,12 @@ def init_optimizer(
     elif hp.optimizer == "muon":
         if device_mesh is not None:
             # Ensure that we have a supported device mesh configuration for Muon
-            if device_mesh["tp"].size() > 1:
+            if inner_shard_mesh.size() > 1:
                 raise ValueError("Tensor parallel is not supported by Muon.")
             distributed_mesh = (
-                device_mesh["fs"] if device_mesh["fs"].size() > 1 else device_mesh["dp"]
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
-            comm_method = "all-to-all" if device_mesh["fs"].size() > 1 else "all-gather"
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
         else:
             assert ddp_model is not None
             distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP

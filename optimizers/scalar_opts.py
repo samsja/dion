@@ -3,7 +3,7 @@ from torch import Tensor
 from typing import List
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def adamw_update(
     X: Tensor,  # Model weights (modified in place)
     G: Tensor,  # Gradient
@@ -52,7 +52,7 @@ def adamw_update(
     X.addcdiv_(M, denom, value=-adj_lr)
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def lion_update(
     X: Tensor,  # Model weights (modified in place)
     G: Tensor,  # Gradient
@@ -86,7 +86,7 @@ def lion_update(
     X.add_(U, alpha=-lr)
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def adamw_update_foreach(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
@@ -102,19 +102,21 @@ def adamw_update_foreach(
     """
     AdamW optimizer algorithm (foreach implementation).
     """
-    assert len(X) == len(G)
-    assert len(X) == len(M)
-    assert len(X) == len(V)
+    batch_size = len(X)
+    assert batch_size == len(G)
+    assert batch_size == len(M)
+    assert batch_size == len(V)
 
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
 
     # Update momentum and variance
     # M = beta1 * M + (1 - beta1) * G
-    torch._foreach_lerp_(M, G, 1 - beta1)
+    torch._foreach_lerp_(M, G, [1 - beta1] * batch_size)
+
     # V = beta2 * V + (1 - beta2) * G * G
-    torch._foreach_mul_(V, beta2)
-    torch._foreach_addcmul_(V, G, G, value=1 - beta2)
+    G_square = torch._foreach_mul(G, G)
+    torch._foreach_lerp_(V, G_square, [1 - beta2] * batch_size)
 
     # Bias correction
     bias_correction1 = 1 - beta1**step
@@ -130,7 +132,7 @@ def adamw_update_foreach(
     # sqrt(V / bias_correction2) = sqrt(V) / sqrt(bias_correction2)
     denom = torch._foreach_sqrt(V)
     torch._foreach_div_(denom, bias_correction2_sqrt)
-    torch._foreach_add_(denom, epsilon)
+    torch._foreach_add_(denom, [epsilon] * batch_size)
 
     # Adjust learning rate to include bias correction 1
     adj_lr = lr / bias_correction1
@@ -140,10 +142,12 @@ def adamw_update_foreach(
 
     # Weight update
     # X = X - adj_lr * M / denom
-    torch._foreach_addcdiv_(X, M, denom, value=-adj_lr)
+    M_div = torch._foreach_div(M, denom)
+    torch._foreach_mul_(M_div, adj_lr)
+    torch._foreach_sub_(X, M_div)
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def lion_update_foreach(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
@@ -156,24 +160,26 @@ def lion_update_foreach(
     """
     Lion optimizer algorithm (foreach implementation).
     """
-    assert len(X) == len(G)
-    assert len(X) == len(M)
+    batch_size = len(X)
+    assert batch_size == len(G)
+    assert batch_size == len(M)
 
     dtype = M[0].dtype
     G = [g.to(dtype=dtype) for g in G]
 
     # Compute sign update
     # U = sign(beta1 * M + (1 - beta1) * G)
-    U = torch._foreach_lerp(M, G, 1 - beta1)
+    U = torch._foreach_lerp(M, G, [1 - beta1] * batch_size)
     torch._foreach_sign_(U)
 
     # Update momentum in place with new gradient
     # M = beta2 * M + (1 - beta2) * G
-    torch._foreach_lerp_(M, G, 1 - beta2)
+    torch._foreach_lerp_(M, G, [1 - beta2] * batch_size)
 
     # Apply weight decay
     torch._foreach_mul_(X, 1 - lr * weight_decay)
 
     # Weight update
     # X = X - lr * U
-    torch._foreach_add_(X, U, alpha=-lr)
+    torch._foreach_mul_(U, lr)
+    torch._foreach_sub_(X, U)

@@ -519,7 +519,7 @@ def lion_update_foreach_async(
     yield
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def muon_update_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
@@ -539,7 +539,8 @@ def muon_update_pre_orthogonalize(
     torch._foreach_add_(M, G)
 
     if nesterov:
-        U = torch._foreach_add(G, M, alpha=momentum)
+        U = torch._foreach_mul(M, momentum)
+        torch._foreach_add_(U, G)
     else:
         U = M
 
@@ -549,7 +550,7 @@ def muon_update_pre_orthogonalize(
     return U
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def muon_update_post_orthogonalize(
     X: List[Tensor],
     U: List[Tensor],
@@ -566,7 +567,8 @@ def muon_update_post_orthogonalize(
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
 
     # Weight update
-    torch._foreach_add_(X, U, alpha=-adjusted_lr)
+    U = torch._foreach_mul(U, adjusted_lr)
+    torch._foreach_sub_(X, U)
 
 
 def muon_update_newton_schulz(
@@ -606,7 +608,7 @@ def adjust_lr_spectral_norm(lr, param_shape):
     return adjusted_lr
 
 
-@torch.compile()
+@torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     """
     Newton-Schulz iteration to approximate the orthogonalization of X.
