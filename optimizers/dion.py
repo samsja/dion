@@ -4,7 +4,7 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from dataclasses import dataclass
 from torch import Tensor
-from torch.distributed import ProcessGroup, ReduceOp
+from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
@@ -36,9 +36,9 @@ class DionParamConfig:
     # Use transposed version of the algorithm
     is_transposed: bool = False
 
-    # Whether to all-reduce compressed PQ instead of full gradient
+    # Whether to all-reduce compressed P and R instead of full gradient
     # This should always be False for 1D tensors
-    all_reduce_PQ = False
+    compressed_all_reduce = False
 
     # Sharding configurations for the Q matrix
     Q_sharded_placements: Optional[Tuple[Placement]] = None
@@ -126,6 +126,11 @@ class Dion(Optimizer):
             raise ValueError(f"Invalid power iterations: {power_iters}")
 
         # Check device mesh
+        if replicate_mesh is not None:
+            if not isinstance(replicate_mesh, (DeviceMesh, ProcessGroup)):
+                raise TypeError(
+                    f"Replicate mesh must be a DeviceMesh or ProcessGroup, but got {type(replicate_mesh)}."
+                )
         if outer_shard_mesh is not None:
             if not isinstance(outer_shard_mesh, DeviceMesh):
                 raise ValueError(
@@ -237,8 +242,11 @@ class Dion(Optimizer):
                 # For each parameter, we either all-reduce its gradient or compressed PQ states
                 # Except when replicate_mesh_grad_sync is False, in which case we assume that
                 # gradients are already synchronized before the optimizer step is called.
-                if self._replicate_mesh_grad_sync and not param_config.all_reduce_PQ:
-                    gradient = self._all_reduce_gradient(param.grad)
+                if (
+                    self._replicate_mesh_grad_sync
+                    and not param_config.compressed_all_reduce
+                ):
+                    gradient = all_reduce(param.grad, self._replicate_mesh)
                 else:
                     gradient = param.grad
 
@@ -253,63 +261,49 @@ class Dion(Optimizer):
                         )
 
                     Q = state["Q"]
-                    all_reduce_PQ = (
-                        self._replicate_mesh_grad_sync and param_config.all_reduce_PQ
+                    compressed_all_reduce = (
+                        self._replicate_mesh_grad_sync
+                        and param_config.compressed_all_reduce
                     )
 
-                    # Dion update for DTensor parameters
-                    if isinstance(param, DTensor):
-                        # Unshard Q along the inner sharding dimension
-                        if param_config.Q_inner_unsharded_placements is not None:
-                            Q = Q.redistribute(
-                                placements=param_config.Q_inner_unsharded_placements,
-                                async_op=True,
-                            )
-                        Q_new = dion_update_dtensor(
-                            X=param,
-                            G=gradient,
-                            M=state["momentum"],
-                            Q=Q,
-                            lr=lr,
-                            mu=mu,
-                            weight_decay=weight_decay,
-                            epsilon=epsilon,
-                            transpose=param_config.is_transposed,
-                            power_iters=self._power_iters,
-                            oversample=oversample,
-                            all_reduce_PQ=all_reduce_PQ,
-                            replicate_mesh=self._replicate_mesh,
-                            inner_shard_mesh_dim=param_config.inner_shard_mesh_dim,
-                        )
-                        # Shard new Q along the inner sharding dimension
-                        if param_config.Q_sharded_placements is not None:
-                            Q_new = Q_new.redistribute(
-                                placements=param_config.Q_sharded_placements,
-                            )
-
-                    # Dion update for non-DTensor parameters
-                    else:
-                        if self._rng is None:
-                            # Lazy initialization of RNG for non-DTensor parameters
-                            # All DP ranks must have identical seed
-                            self._rng = torch.Generator(device=param.device)
-                            self._rng.manual_seed(0)
-                        Q_new = dion_update(
-                            X=param,
-                            G=gradient,
-                            M=state["momentum"],
-                            Q=Q,
-                            lr=lr,
-                            mu=mu,
-                            weight_decay=weight_decay,
-                            epsilon=epsilon,
-                            transpose=param_config.is_transposed,
-                            power_iters=self._power_iters,
-                            oversample=oversample,
-                            all_reduce_PQ=all_reduce_PQ,
-                            rng=self._rng,
+                    # Unshard Q along the inner sharding dimension
+                    if param_config.Q_inner_unsharded_placements is not None:
+                        assert isinstance(Q, DTensor)
+                        Q = Q.redistribute(
+                            placements=param_config.Q_inner_unsharded_placements,
+                            async_op=True,
                         )
 
+                    if not isinstance(param, DTensor) and self._rng is None:
+                        # Lazy initialization of RNG for non-DTensor parameters
+                        # All DP ranks must have identical seed, so we just set to 0 here
+                        self._rng = torch.Generator(device=param.device)
+                        self._rng.manual_seed(0)
+
+                    Q_new = dion_update(
+                        X=param,
+                        G=gradient,
+                        M=state["momentum"],
+                        Q=Q,
+                        lr=lr,
+                        mu=mu,
+                        weight_decay=weight_decay,
+                        epsilon=epsilon,
+                        transpose=param_config.is_transposed,
+                        power_iters=self._power_iters,
+                        oversample=oversample,
+                        compressed_all_reduce=compressed_all_reduce,
+                        replicate_mesh=self._replicate_mesh,
+                        inner_shard_mesh_dim=param_config.inner_shard_mesh_dim,
+                        rng=self._rng,
+                    )
+
+                    # Shard new Q along the inner sharding dimension
+                    if param_config.Q_sharded_placements is not None:
+                        assert isinstance(Q_new, DTensor)
+                        Q_new = Q_new.redistribute(
+                            placements=param_config.Q_sharded_placements,
+                        )
                     state["Q"] = Q_new
 
                 elif algo == "adamw":
@@ -349,28 +343,6 @@ class Dion(Optimizer):
                     raise ValueError(f"Unknown algorithm: {algo}")
 
         return loss
-
-    def _all_reduce_gradient(self, G: Tensor) -> Tensor:
-        """
-        All-reduce the gradient of a tensor over the replicated data-parallel world.
-        """
-        assert G is not None, "Gradient is None."
-        if self._replicate_mesh is None:
-            # No data parallelism used, do nothing
-            pass
-        elif isinstance(self._replicate_mesh, DeviceMesh):
-            assert isinstance(G, DTensor)
-            G = mesh_all_reduce_dtensor(
-                G, reduce_mesh=self._replicate_mesh, reduce_op="avg"
-            )
-        elif isinstance(self._replicate_mesh, ProcessGroup):
-            # dist.all_reduce modifies the tensor in place
-            dist.all_reduce(G, op=ReduceOp.AVG, group=self._replicate_mesh)
-        else:
-            raise ValueError(
-                "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
-            )
-        return G
 
     def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
         """
@@ -529,7 +501,7 @@ class Dion(Optimizer):
         # Set all-reduce PQ based on if it saves communication cost
         # Otherwise we will all-reduce the gradient matrix instead
         if rank_fraction < 1 and (m + n) * r < m * n:
-            param_config.all_reduce_PQ = True
+            param_config.compressed_all_reduce = True
 
         # Get dtype for Q
         if self._mixed_precision_config.Q_dtype is not None:
@@ -602,14 +574,14 @@ def dion_update(
     transpose: bool,
     power_iters: int,
     oversample: float = 1.25,
-    all_reduce_PQ: bool = True,
-    rng: Optional[torch.Generator] = None,
+    compressed_all_reduce: bool = True,
+    replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
+    inner_shard_mesh_dim: Optional[int] = None,  # for DTensor only
+    rng: Optional[torch.Generator] = None,  # for regular tensor only
 ) -> Tensor:
     """
-    Dion optimizer algorithm (non-distributed version)
+    Dion optimizer algorithm.
     """
-    assert not isinstance(X, DTensor)
-
     # Match dtype of Q and M
     Q_init_dtype = Q.dtype
     Q = Q.to(M.dtype)
@@ -624,7 +596,9 @@ def dion_update(
         Q,
         power_iters=power_iters,
         oversample=oversample,
-        all_reduce_PQ=all_reduce_PQ,
+        compressed_all_reduce=compressed_all_reduce,
+        replicate_mesh=replicate_mesh,
+        inner_shard_mesh_dim=inner_shard_mesh_dim,
         rng=rng,
     )
     P, R = fix_all_zero_or_nan(P, R, Q, M)
@@ -632,11 +606,12 @@ def dion_update(
     # Error feedback
     # M = M - (1 - mu) * (P @ R.T)
     if not transpose:
-        M.addmm_(P, R.T, alpha=-(1 - mu))
+        M.add_(P @ R.T, alpha=-(1 - mu))
     else:
-        M.addmm_(R, P.T, alpha=-(1 - mu))
+        M.add_(R @ P.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
+    # DTensor will automatically sync the full-tensor norm
     Q = R / (R.norm(dim=0, keepdim=True) + epsilon)
 
     # Apply weight decay
@@ -648,7 +623,6 @@ def dion_update(
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
     # Apply weight update
-    # Use add_ instead of addmm_ because it's compatible with different dtypes
     # X = X - scaled_lr * (P @ Q.T)
     if not transpose:
         X.add_(P @ Q.T, alpha=-scaled_lr)
@@ -664,8 +638,10 @@ def power_iteration(
     Q_init: Tensor,
     power_iters: int,
     oversample: float,
-    all_reduce_PQ: bool,
-    rng: torch.Generator,
+    compressed_all_reduce: bool,
+    replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
+    inner_shard_mesh_dim: Optional[int] = None,  # for DTensor only
+    rng: Optional[torch.Generator] = None,  # for regular tensor only
 ) -> Tuple[Tensor, Tensor]:
     """
     Returns a low-rank approximation of B by power iteration.
@@ -674,16 +650,24 @@ def power_iteration(
     assert (
         B.dtype == Q_init.dtype
     ), f"Expected inputs to have the same dtype, but got {B.dtype} and {Q_init.dtype}."
+
     Q = Q_init
 
     for _ in range(power_iters):
         P = B @ Q
-        if all_reduce_PQ:
-            dist.all_reduce(P, op=ReduceOp.AVG)
-        P = orthogonalize(P, oversample=oversample, rng=rng)
+        if compressed_all_reduce:
+            P = all_reduce(P, replicate_mesh)
+
+        if isinstance(P, DTensor):
+            P = orthogonalize_dtensor(
+                P, oversample, shard_mesh_dim=inner_shard_mesh_dim
+            )
+        else:
+            P = orthogonalize(P, oversample, rng=rng)
+
         Q = B.T @ P
-        if all_reduce_PQ:
-            dist.all_reduce(Q, op=ReduceOp.AVG)
+        if compressed_all_reduce:
+            Q = all_reduce(Q, replicate_mesh)
 
     return P, Q
 
@@ -696,6 +680,7 @@ def orthogonalize(
     """
     Orthogonalize a matrix P using Randomized Cholesky QR.
     """
+    assert not isinstance(P, DTensor), "Use orthogonalize_dtensor instead"
     m, n = P.shape
     P_dtype = P.dtype
 
@@ -731,176 +716,24 @@ def orthogonalize(
     return Q.to(dtype=P_dtype)
 
 
-def fix_all_zero_or_nan(
-    P: Tensor, Q: Tensor, Q_init: Tensor, B: Tensor
-) -> Tuple[Tensor, Tensor]:
-    """
-    If input is all zero, P and Q will be nan or all zero.
-    We want to return the conditional expressions:
-
-        if is_all_zero:
-            P = torch.zeros_like(P)
-            Q = Q_init
-        else:
-            P = P
-            Q = Q
-
-    Here this is implemented without data-dependent control flow.
-    To avoid additional communication, we handle sharded tensors independently.
-    """
-    B_local = to_local(B)
-    is_all_zero = (B_local == 0).all()
-    not_all_zero = ~is_all_zero
-    P = P.nan_to_num() * not_all_zero
-    Q = Q.nan_to_num() * not_all_zero + Q_init * is_all_zero
-    return P, Q
-
-
-@torch.compile()
-def dion_update_dtensor(
-    X: DTensor,  # Model weights (modified in place)
-    G: DTensor,  # Gradient
-    M: DTensor,  # Momentum buffer (modified in place)
-    Q: DTensor,  # Q matrix for power iteration
-    lr: Tensor,  # Learning rate (scalar tensor)
-    mu: Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
-    epsilon: float,
-    transpose: bool,
-    power_iters: int,
-    oversample: float = 1.25,
-    all_reduce_PQ: bool = True,
-    replicate_mesh: Optional[DeviceMesh] = None,
-    inner_shard_mesh_dim: Optional[int] = None,
-) -> DTensor:
-    """
-    Dion optimizer algorithm (distributed version for DTensor)
-    """
-    # Match dtype of Q and M
-    Q_init_dtype = Q.dtype
-    Q = Q.to(M.dtype)
-
-    # Add new gradient to momentum
-    M.add_(G)
-
-    # Compute low-rank approximation of M = P @ Q^T
-    # M, Q, P, R should all have the same dtype
-    P, R = power_iteration_dtensor(
-        M.T if transpose else M,
-        Q,
-        power_iters=power_iters,
-        oversample=oversample,
-        all_reduce_mesh=replicate_mesh if all_reduce_PQ else None,
-        inner_shard_mesh_dim=inner_shard_mesh_dim,
-    )
-    P, R = fix_all_zero_or_nan(P, R, Q, M)
-
-    # Error feedback
-    if not transpose:
-        M.add_(P @ R.T, alpha=-(1 - mu))
-    else:
-        M.add_(R @ P.T, alpha=-(1 - mu))
-
-    # Column normalize R to get new Q
-    # DTensor should automatically sync the full-tensor norm
-    Q = R / (R.norm(dim=0, keepdim=True) + epsilon)
-
-    # Apply weight decay
-    X.mul_(1 - lr * weight_decay)
-
-    # Compute update scale factor
-    fan_out = X.size(0)
-    fan_in = X.size(1)
-    scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
-
-    # Apply weight update
-    if not transpose:
-        X.add_(P @ Q.T, alpha=-scaled_lr)
-    else:
-        X.add_(Q @ P.T, alpha=-scaled_lr)
-
-    # Return new Q for next iteration
-    return Q.to(Q_init_dtype)
-
-
-def power_iteration_dtensor(
-    B: DTensor,
-    Q_init: DTensor,
-    power_iters: int,
-    oversample: float,
-    all_reduce_mesh: Optional[DeviceMesh] = None,
-    inner_shard_mesh_dim: Optional[int] = None,
-) -> Tuple[DTensor, DTensor]:
-    """
-    Returns a low-rank approximation of B by power iteration.
-    Compute P and Q such that (approximately) B = P @ Q^T.
-    """
-    assert (
-        B.dtype == Q_init.dtype
-    ), f"Expected inputs to have the same dtype, but got {B.dtype} and {Q_init.dtype}."
-    Q = Q_init
-
-    for _ in range(power_iters):
-        P = B @ Q
-        P = mesh_all_reduce_dtensor(P, reduce_mesh=all_reduce_mesh)
-        P = orthogonalize_dtensor(
-            P, oversample=oversample, inner_shard_mesh_dim=inner_shard_mesh_dim
-        )
-        Q = B.T @ P
-        Q = mesh_all_reduce_dtensor(Q, reduce_mesh=all_reduce_mesh)
-
-    return P, Q
-
-
-def mesh_all_reduce_dtensor(
-    tensor: DTensor,
-    reduce_mesh: Optional[DeviceMesh],
-    reduce_op: str = "avg",
-) -> DTensor:
-    # First redistribute any Partial to Replicate
-    if any(p.is_partial() for p in tensor.placements):
-        placements = [Replicate() if p.is_partial() else p for p in tensor.placements]
-        tensor = tensor.redistribute(placements=placements)
-
-    if not reduce_mesh:
-        return tensor
-
-    # All-reduce local shard over each specified dimension
-    tensor_local = tensor.to_local()
-    tensor_local = funcol.all_reduce(
-        tensor_local,
-        reduceOp=reduce_op,
-        group=reduce_mesh,
-    )
-
-    # Convert back to DTensor
-    tensor = DTensor.from_local(
-        tensor_local,
-        device_mesh=tensor.device_mesh,
-        placements=tensor.placements,
-        run_check=False,
-    )
-
-    return tensor
-
-
 def orthogonalize_dtensor(
     P: DTensor,
     oversample: float = 1.25,
-    inner_shard_mesh_dim: Optional[int] = None,
+    shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
     """
     Orthogonalize a matrix P of type DTensor using randomized QR.
-    P has shape (m, r) and can be sharded on inner_shard_mesh_dim. If sharded, it is
+
+    P has shape (m, r) and can be sharded on shard_mesh_dim. If sharded, it is
     assumed to have Shard(0) placement (row-sharded along size-m tensor dimension).
-    The orthogonalized output should have the same shape and sharding as P.
+    The orthogonalized output will have the same shape and sharding as the input P.
     """
     # Get desired placements for output
     m, r = P.shape
     P_dtype = P.dtype
     placements = [Replicate() for _ in range(P.device_mesh.ndim)]
-    if inner_shard_mesh_dim is not None:
-        placements[inner_shard_mesh_dim] = Shard(0)  # rows sharded on inner shard mesh
+    if shard_mesh_dim is not None:
+        placements[shard_mesh_dim] = Shard(0)  # Shard(0) = rows
 
     # Standard QR is faster if matrix is square or wide
     if m <= r:
@@ -917,7 +750,7 @@ def orthogonalize_dtensor(
     else:
         # Apply random sketch to input matrix
         S = generate_random_sketch_dtensor(
-            P, oversample=oversample, inner_shard_mesh_dim=inner_shard_mesh_dim
+            P, oversample=oversample, shard_mesh_dim=shard_mesh_dim
         )
         SP: DTensor = S @ P
 
@@ -953,11 +786,11 @@ def orthogonalize_dtensor(
 def generate_random_sketch_dtensor(
     P: DTensor,
     oversample: float = 1.25,
-    inner_shard_mesh_dim: Optional[int] = None,
+    shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
     """
     Generate a random sketching matrix S of shape (oversample * r, m).
-    If inner_shard_mesh_dim is not None, S will be sharded on that mesh dimension.
+    If shard_mesh_dim is not None, S will be sharded on that mesh dimension.
     S is always Shard(1) which is column-sharded (along size-m tensor dimension).
     """
     # Compute size k and round up to next multiple of 128
@@ -967,8 +800,8 @@ def generate_random_sketch_dtensor(
 
     # Generate random sketching matrix of shape (k, m)
     S_placements = [Replicate() for _ in range(P.device_mesh.ndim)]
-    if inner_shard_mesh_dim is not None:
-        S_placements[inner_shard_mesh_dim] = Shard(1)
+    if shard_mesh_dim is not None:
+        S_placements[shard_mesh_dim] = Shard(1)  # Shard(1) = columns
 
     # DTensor RNG should automatically produce identical results across DP replicas
     S = dtensor_randn(
@@ -980,3 +813,71 @@ def generate_random_sketch_dtensor(
     S *= std
 
     return S
+
+
+def fix_all_zero_or_nan(
+    P: Tensor, Q: Tensor, Q_init: Tensor, B: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """
+    If input is all zero, P and Q will be nan or all zero.
+    We want to return the conditional expressions:
+
+        if is_all_zero:
+            P = torch.zeros_like(P)
+            Q = Q_init
+        else:
+            P = P
+            Q = Q
+
+    Here this is implemented without data-dependent control flow.
+    To avoid additional communication, we handle sharded tensors independently.
+    """
+    B_local = to_local(B)
+    is_all_zero = (B_local == 0).all()
+    not_all_zero = ~is_all_zero
+    P = P.nan_to_num() * not_all_zero
+    Q = Q.nan_to_num() * not_all_zero + Q_init * is_all_zero
+    return P, Q
+
+
+def all_reduce(
+    tensor: Tensor,
+    reduce_mesh: Union[DeviceMesh, ProcessGroup, None],
+    reduce_op: str = "avg",
+) -> Tensor:
+    """
+    Generic all-reduce operation to support both DTensor and regular Tensor.
+    """
+    if isinstance(tensor, DTensor):
+        # First redistribute any Partial to Replicate
+        if any(p.is_partial() for p in tensor.placements):
+            tensor = tensor.redistribute(
+                placements=[
+                    Replicate() if p.is_partial() else p for p in tensor.placements
+                ]
+            )
+
+    if reduce_mesh is None:
+        # No reduce mesh used, do nothing
+        return tensor
+
+    if isinstance(tensor, DTensor):
+        assert isinstance(reduce_mesh, DeviceMesh)
+        # All-reduce local shard over each specified dimension
+        tensor_local = funcol.all_reduce(
+            tensor.to_local(),
+            reduceOp=reduce_op,
+            group=reduce_mesh,
+        )
+        # Convert back to DTensor
+        tensor = DTensor.from_local(
+            tensor_local,
+            device_mesh=tensor.device_mesh,
+            placements=tensor.placements,
+            run_check=False,
+        )
+
+    else:
+        tensor = funcol.all_reduce(tensor, reduceOp=reduce_op, group=reduce_mesh)
+
+    return tensor

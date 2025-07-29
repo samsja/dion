@@ -137,6 +137,11 @@ class Dion(Optimizer):
             raise ValueError("Async Dion only supports power_iters=1")
 
         # Check device mesh
+        if replicate_mesh is not None:
+            if not isinstance(replicate_mesh, (DeviceMesh, ProcessGroup)):
+                raise TypeError(
+                    f"Replicate mesh must be a DeviceMesh or ProcessGroup, but got {type(replicate_mesh)}."
+                )
         if outer_shard_mesh is not None:
             if not isinstance(outer_shard_mesh, DeviceMesh):
                 raise TypeError(
