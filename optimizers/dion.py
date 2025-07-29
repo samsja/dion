@@ -165,13 +165,13 @@ class Dion(Optimizer):
             beta2=betas[1],
             weight_decay=weight_decay,
             epsilon=epsilon,
+            oversample=oversample,
             algorithm="dion",
             step=0,
         )
         super().__init__(params, defaults)
 
         self._power_iters = power_iters
-        self._oversample = oversample
         self._rng = None
 
         # This is intentionally not in self.state so it doesn't get checkpointed
@@ -184,13 +184,13 @@ class Dion(Optimizer):
         self._replicate_mesh_grad_sync = replicate_mesh_grad_sync
 
         # Get global ranks for outer and inner shard meshes
-        if self._outer_shard_mesh is not None and self._outer_shard_mesh.size() > 1:
+        if self._outer_shard_mesh is not None:
             self._outer_shard_ranks = dist.get_process_group_ranks(
                 self._outer_shard_mesh.get_group()
             )
         else:
             self._outer_shard_ranks = None
-        if self._inner_shard_mesh is not None and self._inner_shard_mesh.size() > 1:
+        if self._inner_shard_mesh is not None:
             self._inner_shard_ranks = dist.get_process_group_ranks(
                 self._inner_shard_mesh.get_group()
             )
@@ -224,6 +224,7 @@ class Dion(Optimizer):
             beta2 = torch.tensor(group["beta2"])
             weight_decay = torch.tensor(group["weight_decay"])
             epsilon = torch.tensor(group["epsilon"])
+            oversample = torch.tensor(group["oversample"])
 
             for param in group["params"]:
                 if param.grad is None:
@@ -237,7 +238,9 @@ class Dion(Optimizer):
                 # Except when replicate_mesh_grad_sync is False, in which case we assume that
                 # gradients are already synchronized before the optimizer step is called.
                 if self._replicate_mesh_grad_sync and not param_config.all_reduce_PQ:
-                    self._all_reduce_gradient(param)
+                    gradient = self._all_reduce_gradient(param.grad)
+                else:
+                    gradient = param.grad
 
                 # Call the corresponding update function
                 if algo == "dion":
@@ -264,7 +267,7 @@ class Dion(Optimizer):
                             )
                         Q_new = dion_update_dtensor(
                             X=param,
-                            G=param.grad,
+                            G=gradient,
                             M=state["momentum"],
                             Q=Q,
                             lr=lr,
@@ -273,7 +276,7 @@ class Dion(Optimizer):
                             epsilon=epsilon,
                             transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
-                            oversample=self._oversample,
+                            oversample=oversample,
                             all_reduce_PQ=all_reduce_PQ,
                             replicate_mesh=self._replicate_mesh,
                             inner_shard_mesh_dim=param_config.inner_shard_mesh_dim,
@@ -293,7 +296,7 @@ class Dion(Optimizer):
                             self._rng.manual_seed(0)
                         Q_new = dion_update(
                             X=param,
-                            G=param.grad,
+                            G=gradient,
                             M=state["momentum"],
                             Q=Q,
                             lr=lr,
@@ -302,7 +305,7 @@ class Dion(Optimizer):
                             epsilon=epsilon,
                             transpose=param_config.is_transposed,
                             power_iters=self._power_iters,
-                            oversample=self._oversample,
+                            oversample=oversample,
                             all_reduce_PQ=all_reduce_PQ,
                             rng=self._rng,
                         )
@@ -316,7 +319,7 @@ class Dion(Optimizer):
                     # Sharded DTensor params can be updated element-wise
                     adamw_update(
                         X=to_local(param),
-                        G=to_local(param.grad),
+                        G=to_local(gradient),
                         M=to_local(state["momentum"]),
                         V=to_local(state["variance"]),
                         lr=lr,
@@ -334,7 +337,7 @@ class Dion(Optimizer):
                     # Sharded DTensor params can be updated element-wise
                     lion_update(
                         X=to_local(param),
-                        G=to_local(param.grad),
+                        G=to_local(gradient),
                         M=to_local(state["momentum"]),
                         lr=lr,
                         beta1=beta1,
@@ -347,26 +350,27 @@ class Dion(Optimizer):
 
         return loss
 
-    def _all_reduce_gradient(self, tensor: Tensor):
+    def _all_reduce_gradient(self, G: Tensor) -> Tensor:
         """
         All-reduce the gradient of a tensor over the replicated data-parallel world.
         """
-        assert tensor.grad is not None, "Gradient is None."
+        assert G is not None, "Gradient is None."
         if self._replicate_mesh is None:
             # No data parallelism used, do nothing
             pass
         elif isinstance(self._replicate_mesh, DeviceMesh):
-            assert isinstance(tensor.grad, DTensor)
-            reduced_grad = mesh_all_reduce_dtensor(
-                tensor.grad, reduce_mesh=self._replicate_mesh, reduce_op="avg"
+            assert isinstance(G, DTensor)
+            G = mesh_all_reduce_dtensor(
+                G, reduce_mesh=self._replicate_mesh, reduce_op="avg"
             )
-            tensor.grad = reduced_grad
         elif isinstance(self._replicate_mesh, ProcessGroup):
-            dist.all_reduce(tensor.grad, op=ReduceOp.AVG, group=self._replicate_mesh)
+            # dist.all_reduce modifies the tensor in place
+            dist.all_reduce(G, op=ReduceOp.AVG, group=self._replicate_mesh)
         else:
             raise ValueError(
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
             )
+        return G
 
     def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
         """
@@ -623,6 +627,7 @@ def dion_update(
         all_reduce_PQ=all_reduce_PQ,
         rng=rng,
     )
+    P, R = fix_all_zero_or_nan(P, R, Q, M)
 
     # Error feedback
     # M = M - (1 - mu) * (P @ R.T)
@@ -680,7 +685,7 @@ def power_iteration(
         if all_reduce_PQ:
             dist.all_reduce(Q, op=ReduceOp.AVG)
 
-    return fix_all_zero_or_nan(P, Q, Q_init, B)
+    return P, Q
 
 
 def orthogonalize(
@@ -771,7 +776,6 @@ def dion_update_dtensor(
     """
     Dion optimizer algorithm (distributed version for DTensor)
     """
-
     # Match dtype of Q and M
     Q_init_dtype = Q.dtype
     Q = Q.to(M.dtype)
@@ -789,6 +793,7 @@ def dion_update_dtensor(
         all_reduce_mesh=replicate_mesh if all_reduce_PQ else None,
         inner_shard_mesh_dim=inner_shard_mesh_dim,
     )
+    P, R = fix_all_zero_or_nan(P, R, Q, M)
 
     # Error feedback
     if not transpose:
@@ -844,7 +849,7 @@ def power_iteration_dtensor(
         Q = B.T @ P
         Q = mesh_all_reduce_dtensor(Q, reduce_mesh=all_reduce_mesh)
 
-    return fix_all_zero_or_nan(P, Q, Q_init, B)
+    return P, Q
 
 
 def mesh_all_reduce_dtensor(
@@ -855,7 +860,7 @@ def mesh_all_reduce_dtensor(
     # First redistribute any Partial to Replicate
     if any(p.is_partial() for p in tensor.placements):
         placements = [Replicate() if p.is_partial() else p for p in tensor.placements]
-        tensor = tensor.redistribute(placements=placements, async_op=True)
+        tensor = tensor.redistribute(placements=placements)
 
     if not reduce_mesh:
         return tensor

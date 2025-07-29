@@ -176,11 +176,11 @@ class Dion(Optimizer):
             beta2=betas[1],
             weight_decay=weight_decay,
             epsilon=epsilon,
+            oversample=oversample,
             algorithm="dion",
             step=0,
         )
         super().__init__(params, defaults)
-        self._oversample = oversample
 
         # This is intentionally not in self.state so it doesn't get checkpointed
         # State here may change upon resharding a checkpoint, so we recompute it
@@ -279,6 +279,7 @@ class Dion(Optimizer):
             mu = torch.tensor(group["mu"])
             weight_decay = torch.tensor(group["weight_decay"])
             epsilon = torch.tensor(group["epsilon"])
+            oversample = torch.tensor(group["oversample"])
 
             # Split parameters in this param group by sharding
             split_param_dict = self._split_params_by_sharding(group_params)
@@ -330,7 +331,7 @@ class Dion(Optimizer):
                             param_config=param_config,
                             replicate_mesh=self._replicate_mesh,
                             replicate_mesh_grad_sync=self._replicate_mesh_grad_sync,
-                            oversample=self._oversample,
+                            oversample=oversample,
                         )
                     )
 
