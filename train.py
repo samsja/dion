@@ -312,7 +312,7 @@ def init_optimizer(
     if device_mesh is not None:
         replicate_mesh = device_mesh["dp"]
         outer_shard_mesh = device_mesh["fs"]
-        inner_shard_mesh = device_mesh["tp"]
+        inner_shard_mesh = device_mesh["tp"] if device_mesh["tp"].size() > 1 else None
     else:
         assert ddp_model is not None
         replicate_mesh = ddp_model.process_group
@@ -320,6 +320,8 @@ def init_optimizer(
         inner_shard_mesh = None
 
     if hp.optimizer == "dion":
+        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Compressed data-parallel gradient sync: {cli_args.opt_grad_sync}")
         opt = Dion(
             param_groups,
             replicate_mesh=replicate_mesh,
@@ -334,6 +336,8 @@ def init_optimizer(
         )
 
     elif hp.optimizer == "dion_async":
+        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Compressed data-parallel gradient sync: {cli_args.opt_grad_sync}")
         opt = DionAsync(
             param_groups,
             replicate_mesh=replicate_mesh,
@@ -350,7 +354,7 @@ def init_optimizer(
     elif hp.optimizer == "muon":
         if device_mesh is not None:
             # Ensure that we have a supported device mesh configuration for Muon
-            if inner_shard_mesh.size() > 1:
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
                 raise ValueError("Tensor parallel is not supported by Muon.")
             distributed_mesh = (
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
@@ -377,6 +381,7 @@ def init_optimizer(
     elif hp.optimizer == "dion_reference":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
         assert hp.approx_method is not None
+        print0(f"Dion rank fraction: {hp.rank_fraction}")
         if hp.efficient == True:
             assert hp.rank_fraction <= 0.5, (
                 "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
@@ -395,6 +400,7 @@ def init_optimizer(
 
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
+        print0(f"Dion rank fraction: {hp.rank_fraction}")
         opt = DionSimple(
             param_groups,
             lr=hp.lr,
@@ -431,10 +437,10 @@ def init_optimizer(
         raise ValueError(f"Unsupported optimizer: {hp.optimizer}")
 
     # Check opt_grad_sync and optimizer combination
-    if cli_args.opt_grad_sync and hp.optimizer != "dion":
+    if cli_args.opt_grad_sync and hp.optimizer not in ("dion", "dion_async"):
         # Results will be wrong if opt_grad_sync is set for non-Dion optimizer
         raise ValueError("--opt_grad_sync is set for non-Dion optimizer")
-    if not cli_args.opt_grad_sync and hp.optimizer == "dion":
+    if not cli_args.opt_grad_sync and hp.optimizer in ("dion", "dion_async"):
         # Using Dion without opt_grad_sync means we won't get communication savings
         print0("Warning: not using --opt_grad_sync for Dion optimizer")
 

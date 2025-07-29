@@ -139,7 +139,7 @@ class Dion(Optimizer):
         # Check device mesh
         if outer_shard_mesh is not None:
             if not isinstance(outer_shard_mesh, DeviceMesh):
-                raise ValueError(
+                raise TypeError(
                     f"Outer shard mesh must be a DeviceMesh, but got {type(outer_shard_mesh)}."
                 )
             if outer_shard_mesh.ndim != 1:
@@ -152,7 +152,7 @@ class Dion(Optimizer):
                 )
         if inner_shard_mesh is not None:
             if not isinstance(inner_shard_mesh, DeviceMesh):
-                raise ValueError(
+                raise TypeError(
                     f"Inner shard mesh must be a DeviceMesh, but got {type(inner_shard_mesh)}."
                 )
             if inner_shard_mesh.ndim != 1:
@@ -199,16 +199,16 @@ class Dion(Optimizer):
         elif replicate_mesh is None:
             self._replicate_world_size = 1
         else:
-            raise ValueError(f"Invalid replicate mesh type: {type(replicate_mesh)}.")
+            raise TypeError(f"Invalid replicate mesh type: {type(replicate_mesh)}.")
 
         # Get global ranks for outer and inner shard meshes
-        if self._outer_shard_mesh is not None and self._outer_shard_mesh.size() > 1:
+        if self._outer_shard_mesh is not None:
             self._outer_shard_ranks = dist.get_process_group_ranks(
                 self._outer_shard_mesh.get_group()
             )
         else:
             self._outer_shard_ranks = None
-        if self._inner_shard_mesh is not None and self._inner_shard_mesh.size() > 1:
+        if self._inner_shard_mesh is not None:
             self._inner_shard_ranks = dist.get_process_group_ranks(
                 self._inner_shard_mesh.get_group()
             )
@@ -269,23 +269,6 @@ class Dion(Optimizer):
         Helper function to create batches of Dion matrices and generate
         AsyncTask objects so we can process multiple batches concurrently.
         """
-        # Select the appropriate Dion implementation based on sharding
-        if self._inner_shard_mesh is not None:
-            dion_update_func = dion_update_fsdp_tp
-            batch_size = self._inner_shard_mesh.size()
-            use_dtensor = True
-        elif self._outer_shard_mesh is not None:
-            dion_update_func = dion_update_fsdp
-            batch_size = self._outer_shard_mesh.size()
-            use_dtensor = True
-        else:
-            dion_update_func = dion_update_ddp
-            batch_size = self._replicate_world_size
-            use_dtensor = False  # no sharded matrices in this case
-
-        # If replicate_mesh_grad_sync is True, the optimizer needs to all-reduce gradients
-        # If replicate_mesh_grad_sync is False, gradients are already synchronized
-
         for group in param_groups:
             group_params = [p for p in group["params"] if p.grad is not None]
             if not group_params:
@@ -297,36 +280,59 @@ class Dion(Optimizer):
             weight_decay = torch.tensor(group["weight_decay"])
             epsilon = torch.tensor(group["epsilon"])
 
-            # Create batches of parameters
-            for params in create_param_batches(group_params, batch_size=batch_size):
-                gradients = [p.grad for p in params]
-                states = [self._get_or_initialize_state(p, group) for p in params]
-                momentums = [s["momentum"] for s in states]
-                Qs = [s["Q"] for s in states]
-                param_config = self._get_dion_param_config(params[0])
+            # Split parameters in this param group by sharding
+            split_param_dict = self._split_params_by_sharding(group_params)
+            for sharding_type, split_params in split_param_dict.items():
+                if not split_params:
+                    continue
 
-                if not use_dtensor:
-                    params = to_local(params)
-                    gradients = to_local(gradients)
-                    momentums = to_local(momentums)
-                    Qs = to_local(Qs)
+                # Pick the appropriate update function and batch size based on sharding
+                # Batch size should equal the number of devices in the mesh
+                if sharding_type == "inner_sharded":
+                    dion_update_func = dion_update_fsdp_tp
+                    batch_size = self._inner_shard_mesh.size()
+                    use_dtensor = True
+                elif sharding_type == "outer_sharded":
+                    dion_update_func = dion_update_fsdp
+                    batch_size = self._outer_shard_mesh.size()
+                    use_dtensor = True
+                elif sharding_type == "non_sharded":
+                    dion_update_func = dion_update_ddp
+                    batch_size = self._replicate_world_size
+                    use_dtensor = False
+                else:
+                    raise RuntimeError("Unknown sharding type")
 
-                yield AsyncTask(
-                    dion_update_func(
-                        X=pad_batch(params, batch_size),
-                        G=pad_batch(gradients, batch_size),
-                        M=pad_batch(momentums, batch_size),
-                        Q=pad_batch(Qs, batch_size),
-                        lr=lr,
-                        mu=mu,
-                        weight_decay=weight_decay,
-                        epsilon=epsilon,
-                        param_config=param_config,
-                        replicate_mesh=self._replicate_mesh,
-                        replicate_mesh_grad_sync=self._replicate_mesh_grad_sync,
-                        oversample=self._oversample,
+                # Create batches of parameters
+                for params in create_param_batches(split_params, batch_size):
+                    gradients = [p.grad for p in params]
+                    states = [self._get_or_initialize_state(p, group) for p in params]
+                    momentums = [s["momentum"] for s in states]
+                    Qs = [s["Q"] for s in states]
+                    param_config = self._get_dion_param_config(params[0])
+
+                    if not use_dtensor:
+                        params = to_local(params)
+                        gradients = to_local(gradients)
+                        momentums = to_local(momentums)
+                        Qs = to_local(Qs)
+
+                    yield AsyncTask(
+                        dion_update_func(
+                            X=pad_batch(params, batch_size),
+                            G=pad_batch(gradients, batch_size),
+                            M=pad_batch(momentums, batch_size),
+                            Q=pad_batch(Qs, batch_size),
+                            lr=lr,
+                            mu=mu,
+                            weight_decay=weight_decay,
+                            epsilon=epsilon,
+                            param_config=param_config,
+                            replicate_mesh=self._replicate_mesh,
+                            replicate_mesh_grad_sync=self._replicate_mesh_grad_sync,
+                            oversample=self._oversample,
+                        )
                     )
-                )
 
     def _create_lion_tasks(
         self,
@@ -463,9 +469,9 @@ class Dion(Optimizer):
         )
         using_process_group = isinstance(self._replicate_mesh, ProcessGroup)
         if using_device_mesh and not isinstance(x, DTensor):
-            raise ValueError("When using DeviceMesh, all parameters must be DTensor.")
+            raise TypeError("When using DeviceMesh, all parameters must be DTensor.")
         if using_process_group and isinstance(x, DTensor):
-            raise ValueError(
+            raise TypeError(
                 "When using DTensor parameters, the data parallel group must be specified by a DeviceMesh instead of ProcessGroup."
             )
 
@@ -500,7 +506,7 @@ class Dion(Optimizer):
 
                 # Check for double sharding on same tensor dimension
                 if dim_map[tensor_dim] is not None:
-                    raise ValueError(
+                    raise RuntimeError(
                         f"Got double-sharded DTensor for tensor dimension {placement.dim}."
                     )
                 dim_map[tensor_dim] = mesh_dim
@@ -523,7 +529,7 @@ class Dion(Optimizer):
 
                 # Check for double sharding on same mesh dimension
                 if outer_sharded and inner_sharded:
-                    raise ValueError(
+                    raise RuntimeError(
                         "Cannot have outer and inner sharding over the same process group."
                     )
 
@@ -535,7 +541,7 @@ class Dion(Optimizer):
                     and not outer_sharded
                     and not inner_sharded
                 ):
-                    raise ValueError(
+                    raise RuntimeError(
                         f"Got DTensor sharded on unrecognized {mesh_dim=}, which does not match outer_shard_mesh or inner_shard_mesh."
                     )
 
@@ -549,6 +555,33 @@ class Dion(Optimizer):
 
         self._param_config[x] = config
         return config
+
+    def _split_params_by_sharding(
+        self, params: List[Tensor]
+    ) -> Dict[str, List[Tensor]]:
+        """
+        Sort parameters into inner-sharded, outer-sharded, and non-sharded lists.
+        This determines the parallelization strategy used to compute the update.
+        The "inner sharding" dimension needs to use distributed orthogonalization.
+        """
+        inner_sharded = []
+        outer_sharded = []
+        non_sharded = []
+
+        for p in params:
+            config = self._get_dion_param_config(p)
+            if config.inner_shard_mesh_dim is not None:
+                inner_sharded.append(p)
+            elif config.outer_shard_mesh_dim is not None:
+                outer_sharded.append(p)
+            else:
+                non_sharded.append(p)
+
+        return {
+            "inner_sharded": inner_sharded,
+            "outer_sharded": outer_sharded,
+            "non_sharded": non_sharded,
+        }
 
     def _init_opt_state_momentum(self, param: Tensor, state: Dict[str, Any]):
         # Create the momentum buffer
@@ -651,7 +684,7 @@ class Dion(Optimizer):
         elif isinstance(self._replicate_mesh, ProcessGroup):
             dist.broadcast(tensor, group=self._replicate_mesh, group_src=0)
         else:
-            raise ValueError(
+            raise TypeError(
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
             )
 
@@ -704,34 +737,23 @@ def dion_update_ddp(
         and not param_config.compressed_all_reduce
         and replicate_mesh is not None
     ):
-        G = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
+        G = all_reduce_replicate_mesh(G, replicate_mesh, return_dtensor=False)
         yield
 
-    # Match dtype of Q and M
-    # Stack Q into 3D tensor of shape (batch_size, n, r)
-    M_dtype = M[0].dtype
-    Q_init_dtype = Q[0].dtype
-    Q_batch = torch.stack([q.to(M_dtype) for q in Q])
-
     # Add new gradient to momentum
-    # Stack into 3D tensor of shape (batch_size, m, n) (when non-transposed)
     torch._foreach_add_(M, G)
-    if param_config.is_transposed:
-        M_batch = torch.stack([m.T for m in M])
-    else:
-        M_batch = torch.stack(M)
 
     # Compute low-rank approximation of M = P @ Q^T
-    # M, Q, P, R should all have the same dtype
+    # M_batch shape is (batch_size, m, n)
     # P_batch shape is (batch_size, m, r)
     # Q_batch shape is (batch_size, n, r)
+    M_batch, Q_batch = tensor_list_to_batch(M, Q, param_config.is_transposed)
     P_batch = M_batch @ Q_batch
 
-    if (
-        replicate_mesh_grad_sync
-        and param_config.compressed_all_reduce
-        and replicate_mesh is not None
-    ):
+    compressed_all_reduce = (
+        replicate_mesh_grad_sync and param_config.compressed_all_reduce
+    )
+    if compressed_all_reduce and replicate_mesh is not None:
         # Synchronize P across all DDP ranks by reduce-scatter
         # Each rank will orthogonalize one full matrix in the batch
         P_single = funcol.reduce_scatter_tensor(
@@ -746,32 +768,10 @@ def dion_update_ddp(
         # We can just take one matrix of the batch
         P_single = P_batch[device_rank : device_rank + 1]
 
-    # Orthogonalize P_single using QR decomposition
-    # Standard QR is faster if matrix is square or wide
-    _, m, r = P_single.shape
-    if m <= r:
-        P_single, _ = torch.linalg.qr(P_single.to(dtype=torch.float32))
-        P_single = P_single.to(dtype=M_dtype).contiguous()
+    # Orthogonalize one matrix in the batch
+    P_single = orthogonalize(P_single, oversample=oversample)
 
-    # Randomized Cholesky QR
-    else:
-        # Orthogonalize P_single using random sketch QR
-        S_single = generate_random_sketch_matrix(P_single, oversample)
-        SP_single = S_single @ P_single
-        _, R_single = torch.linalg.qr(SP_single.to(dtype=torch.float32), mode="r")
-        P_single = torch.linalg.solve_triangular(
-            R_single, P_single.to(dtype=torch.float32), upper=True, left=False
-        )
-
-        # Apply Cholesky QR to better orthogonalize
-        PP_single = P_single.mT @ P_single
-        R_single, _ = torch.linalg.cholesky_ex(PP_single, upper=True)
-        P_single = torch.linalg.solve_triangular(
-            R_single, P_single, upper=True, left=False
-        )
-        P_single = P_single.to(dtype=M_dtype).contiguous()
-
-    # All gather P_batch from the per-device single matrices
+    # All gather orthogonal P_batch from the per-device single matrices
     if replicate_mesh is not None:
         P_batch = funcol.all_gather_tensor(
             P_single,
@@ -786,20 +786,11 @@ def dion_update_ddp(
     # M_batch shape is (batch_size, m, n)
     # P_batch shape is (batch_size, m, r)
     # R_batch shape is (batch_size, n, r)
-    # Note that this is a different R than the triangular matrix from orthogonalization
     R_batch = M_batch.mT @ P_batch
 
     # Synchronize R across all DDP ranks by all-reduce
-    if (
-        replicate_mesh_grad_sync
-        and param_config.compressed_all_reduce
-        and replicate_mesh is not None
-    ):
-        R_batch = funcol.all_reduce(
-            R_batch,
-            reduceOp="avg",
-            group=replicate_mesh,
-        )
+    if compressed_all_reduce and replicate_mesh is not None:
+        R_batch = all_reduce_replicate_mesh(R_batch, replicate_mesh)
         yield
 
     # NaN check
@@ -814,23 +805,24 @@ def dion_update_ddp(
     # Column normalize R to get new Q
     Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
 
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
-
     # Compute update scale factor
     fan_out = X[0].size(0)
     fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
-    # Apply weight update
-    # X = X - scaled_lr * P @ Q.T
+    # Apply weight decay and weight update
+    # X = (1 - lr * weight_decay) * X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
+        X,
+        P_batch,
+        Q_batch,
+        alpha=-scaled_lr,
+        beta=1 - lr * weight_decay,
+        transpose=param_config.is_transposed,
     )
 
     # Update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
-    torch._foreach_copy_(Q, Q_new)
+    update_Q_matrix_(Q, Q_batch)
 
 
 def dion_update_fsdp(
@@ -865,97 +857,57 @@ def dion_update_fsdp(
         and not param_config.compressed_all_reduce
         and replicate_mesh is not None
     ):
-        G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
+        G = all_reduce_replicate_mesh(G, replicate_mesh)
         yield
-        G = dtensor_from_local(G_local, ref=G[0])
-
-    # Match dtype of Q and M
-    # Stack Q into 3D tensor of shape (batch_size, n/outer, r)
-    M_dtype = M[0].dtype
-    Q_init_dtype = Q[0].dtype
-    Q_batch = torch.stack([q.to(M_dtype) for q in Q])
 
     # Add new gradient to momentum
-    # Stack into 3D tensor of shape (batch_size, m, n/outer) (when non-transposed)
     torch._foreach_add_(M, G)
-    if param_config.is_transposed:
-        M_batch = torch.stack([m.T for m in M])
-    else:
-        M_batch = torch.stack(M)
 
     # Compute low-rank approximation of M = P @ Q^T
-    # M, Q, P, R should all have the same dtype
+    # M_batch shape is (batch_size, m, n/outer)
     # P_batch shape is (batch_size, m, r)
     # Q_batch shape is (batch_size, n/outer, r)
-    P_batch = M_batch @ Q_batch
+    M_batch, Q_batch = tensor_list_to_batch(M, Q, param_config.is_transposed)
+    P_batch: DTensor = M_batch @ Q_batch
 
-    # Reduce scatter P to get a single full matrix of the batch
-    P_batch_placements = [
-        Replicate() if p.is_partial() else p for p in P_batch.placements
-    ]
-    P_single_placements = [
-        Shard(0) if p.is_partial() else p for p in P_batch.placements
-    ]
+    # Get a single full matrix of the batch
+    # Shard(0) = shard on batch dimension
+    P_single = P_batch.redistribute(
+        placements=[Shard(0) if p.is_partial() else p for p in P_batch.placements],
+        async_op=True,
+    )
+    yield
+
     # If compressed_all_reduce is True, also average over replicate mesh
     compressed_all_reduce = (
         replicate_mesh_grad_sync and param_config.compressed_all_reduce
     )
-    P_local = reduce_scatter_partial_tensor(
-        P_batch,
-        partial_mesh_dim=param_config.outer_shard_mesh_dim,
-        scatter_dim=0,  # dim 0 = batch
-        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
-        return_dtensor=False,
+    if compressed_all_reduce and replicate_mesh is not None:
+        P_single = all_reduce_replicate_mesh(P_single, replicate_mesh)
+        yield
+
+    # Orthogonalize one matrix in the batch
+    P_single = orthogonalize(P_single, oversample=oversample)
+
+    # All gather orthogonal P_batch from the per-device single matrices
+    P_batch = P_single.redistribute(
+        placements=[Replicate() for _ in P_single.placements], async_op=True
     )
-    yield
-    P_single = DTensor.from_local(
-        P_local,
-        device_mesh=P_batch.device_mesh,
-        placements=P_single_placements,
-    )
-
-    # Orthogonalize P_single using QR decomposition
-    # Standard QR is faster if matrix is square or wide
-    _, m, r = P_single.shape  # this is unsharded tensor shape
-    if m <= r:
-        P_single = qr_dtensor(P_single, return_R=False, out_dtype=M_dtype)
-
-    # Randomized Cholesky QR
-    else:
-        # Orthogonalize P_single using random sketch QR
-        S_single = generate_random_sketch_matrix(P_single, oversample)
-        SP_single = S_single @ P_single
-        R_single = qr_dtensor(SP_single, return_R=True, out_dtype=torch.float32)
-        P_single = solve_triangular_dtensor(P_single, R_single, out_dtype=torch.float32)
-
-        # Apply Cholesky QR to better orthogonalize
-        PP_single = P_single.mT @ P_single
-        R_single = cholesky_dtensor(PP_single, upper=True, out_dtype=torch.float32)
-        P_single = solve_triangular_dtensor(P_single, R_single, out_dtype=M_dtype)
-
-    # All gather P_batch from the per-device single matrices
-    P_batch = P_single.redistribute(placements=P_batch_placements, async_op=True)
     yield
 
     # M_batch shape is (batch_size, m, n/outer)
     # P_batch shape is (batch_size, m, r)
     # R_batch shape is (batch_size, n/outer, r)
-    # Note that this is a different R than the triangular matrix from orthogonalization
-    R_batch = M_batch.mT @ P_batch
+    R_batch: DTensor = M_batch.mT @ P_batch
 
-    # All reduce R to average over replicate mesh
+    # The contracting dimension of R = M.mT @ P should not be sharded
+    # There should not be any Partial() placements, so no need to redistribute
+    assert not any(p.is_partial() for p in R_batch.placements)
+
+    # If compressed_all_reduce is True, also average over replicate mesh
     if compressed_all_reduce and replicate_mesh is not None:
-        # The contracting dimension of R = M.mT @ P isn't sharded
-        # There should not be any partial placements
-        assert not any(p.is_partial() for p in R_batch.placements)
-        R_local = all_reduce_partial_tensor(
-            R_batch,
-            partial_mesh_dim=None,
-            replicate_mesh=replicate_mesh,
-            return_dtensor=False,
-        )
+        R_batch = all_reduce_replicate_mesh(R_batch, replicate_mesh)
         yield
-        R_batch = dtensor_from_local(R_local, ref=R_batch)
 
     # NaN check
     P_batch, R_batch = fix_all_zero_or_nan(P_batch, R_batch, Q_batch, M_batch)
@@ -989,23 +941,24 @@ def dion_update_fsdp(
     else:
         Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
 
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
-
     # Compute update scale factor
     fan_out = X[0].size(0)
     fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
-    # Apply weight update
-    # X = X - scaled_lr * P @ Q.T
+    # Apply weight decay and weight update
+    # X = (1 - lr * weight_decay) * X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
+        X,
+        P_batch,
+        Q_batch,
+        alpha=-scaled_lr,
+        beta=1 - lr * weight_decay,
+        transpose=param_config.is_transposed,
     )
 
     # Update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
-    torch._foreach_copy_(Q, Q_new)
+    update_Q_matrix_(Q, Q_batch)
 
 
 def dion_update_fsdp_tp(
@@ -1038,9 +991,11 @@ def dion_update_fsdp_tp(
         and not param_config.compressed_all_reduce
         and replicate_mesh is not None
     ):
-        G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
+        G = all_reduce_replicate_mesh(G, replicate_mesh)
         yield
-        G = dtensor_from_local(G_local, ref=G[0])
+
+    # Add new gradient to momentum
+    torch._foreach_add_(M, G)
 
     # Unshard Q along the inner sharding dimension
     if param_config.Q_inner_unsharded_placements is not None:
@@ -1055,142 +1010,49 @@ def dion_update_fsdp_tp(
         ]
         yield
 
-    # Match dtype of Q and M
-    # Stack Q into 3D tensor of shape (batch_size, n/outer, r)
-    M_dtype = M[0].dtype
-    Q_init_dtype = Q[0].dtype
-    Q_batch = torch.stack([q.to(M_dtype) for q in Q])
-
-    # Add new gradient to momentum and stack into 3D batch
-    # M_batch shape is (batch_size, m/inner, n/outer) (when non-transposed)
-    torch._foreach_add_(M, G)
-    if param_config.is_transposed:
-        M_batch = torch.stack([m.T for m in M])
-    else:
-        M_batch = torch.stack(M)
-
     # Compute low-rank approximation of M = P @ Q^T
-    # M, Q, P, R should all have the same dtype
+    # M_batch shape is (batch_size, m/inner, n/outer)
     # P_batch shape is (batch_size, m/inner, r)
     # Q_batch shape is (batch_size, n/outer, r)
-    P_batch = M_batch @ Q_batch
+    M_batch, Q_batch = tensor_list_to_batch(M, Q, param_config.is_transposed)
+    P_batch: DTensor = M_batch @ Q_batch
 
-    # All reduce P to sum over shard mesh
+    # All reduce P to get the sharded matrix multiplication result
+    P_batch = P_batch.redistribute(
+        placements=[Replicate() if p.is_partial() else p for p in P_batch.placements],
+        async_op=True,
+    )
+    yield
+
     # If compressed_all_reduce is True, also average over replicate mesh
     compressed_all_reduce = (
         replicate_mesh_grad_sync and param_config.compressed_all_reduce
     )
-    P_placements = [Replicate() if p.is_partial() else p for p in P_batch.placements]
-    P_local = all_reduce_partial_tensor(
-        P_batch,
-        partial_mesh_dim=param_config.outer_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
-        return_dtensor=False,
-    )
-    yield
-    P_batch = DTensor.from_local(
-        P_local,
-        device_mesh=P_batch.device_mesh,
-        placements=P_placements,
-    )
+    if compressed_all_reduce and replicate_mesh is not None:
+        P_batch = all_reduce_replicate_mesh(P_batch, replicate_mesh)
+        yield
 
     # Orthogonalize P_batch
-    # Each GPU along inner shard mesh gets one full matrix of the batch
-    # Shard along dim 0 = batch
-    _, m, r = P_batch.shape  # this is unsharded tensor shape
-    batch_sharded_placements = [Replicate() for _ in P_placements]
-    if param_config.inner_shard_mesh_dim is not None:
-        batch_sharded_placements[param_config.inner_shard_mesh_dim] = Shard(0)
-
-    # Standard QR is faster if matrix is square or wide
-    if m <= r:
-        P_single = P_batch.redistribute(
-            placements=batch_sharded_placements,
-            async_op=True,
-        )  # this should do all-to-all
-        yield
-
-        # Compute Q matrix of QR decomposition
-        P_single = qr_dtensor(P_single, return_R=False, out_dtype=M_dtype)
-
-        P_batch = P_single.redistribute(
-            placements=P_placements,
-            async_op=True,
-        )  # this should do all-to-all
-        yield
-
-    # Randomized Cholesky QR
-    else:
-        # Generate the random sketch matrix S
-        # P_batch shape is (batch_size, m/inner, r)
-        # S_batch shape is (batch_size, k, m/inner)
-        S_batch = generate_random_sketch_matrix(
-            P_batch, oversample, shard_mesh_dim=param_config.inner_shard_mesh_dim
-        )
-
-        # SP_batch shape is (batch_size, k, r)
-        # SP_single shape is (1, k, r) after redistribute
-        SP_batch: DTensor = S_batch @ P_batch
-        SP_single = SP_batch.redistribute(
-            placements=batch_sharded_placements,
-            async_op=True,
-        )  # this should do reduce-scatter
-        yield
-
-        # Compute R matrix using QR decomposition
-        R_single = qr_dtensor(SP_single, return_R=True, out_dtype=torch.float32)
-
-        R_batch = R_single.redistribute(
-            placements=[Replicate() for _ in P_placements],
-            async_op=True,
-        )  # this should do all-gather
-        yield
-
-        # Solve for orthogonalized P_batch
-        P_batch = solve_triangular_dtensor(P_batch, R_batch, out_dtype=torch.float32)
-
-        # Apply Cholesky QR to better orthogonalize P_batch
-        # PP_batch shape is (batch_size, r, r)
-        PP_batch: DTensor = P_batch.mT @ P_batch
-        PP_single = PP_batch.redistribute(
-            placements=batch_sharded_placements,
-            async_op=True,
-        )  # this should do reduce-scatter
-        yield
-
-        # Compute R matrix using Cholesky decomposition
-        R_single = cholesky_dtensor(PP_single, upper=True, out_dtype=torch.float32)
-
-        R_batch = R_single.redistribute(
-            placements=[Replicate() for _ in P_placements],
-            async_op=True,
-        )  # this should do all-gather
-        yield
-
-        # Solve for orthogonalized P_batch
-        P_batch = solve_triangular_dtensor(P_batch, R_batch, out_dtype=M_dtype)
+    P_batch = distributed_orthogonalize(
+        P_batch, oversample, shard_mesh_dim=param_config.inner_shard_mesh_dim
+    )
 
     # M_batch shape is (batch_size, m/inner, n/outer)
     # P_batch shape is (batch_size, m/inner, r)
     # R_batch shape is (batch_size, n/outer, r)
-    # Note that this is a different R than the triangular matrix from orthogonalization
-    R_batch = M_batch.mT @ P_batch
+    R_batch: DTensor = M_batch.mT @ P_batch
 
-    # All reduce R to sum over shard mesh
-    # If compressed_all_reduce is True, also average over replicate mesh
-    R_placements = [Replicate() if p.is_partial() else p for p in R_batch.placements]
-    R_local = all_reduce_partial_tensor(
-        R_batch,
-        partial_mesh_dim=param_config.inner_shard_mesh_dim,
-        replicate_mesh=replicate_mesh if compressed_all_reduce else None,
-        return_dtensor=False,
+    # All reduce R to get the sharded matrix multiplication result
+    R_batch = R_batch.redistribute(
+        placements=[Replicate() if p.is_partial() else p for p in R_batch.placements],
+        async_op=True,
     )
     yield
-    R_batch = DTensor.from_local(
-        R_local,
-        device_mesh=R_batch.device_mesh,
-        placements=R_placements,
-    )
+
+    # If compressed_all_reduce is True, also average over replicate mesh
+    if compressed_all_reduce and replicate_mesh is not None:
+        R_batch = all_reduce_replicate_mesh(R_batch, replicate_mesh)
+        yield
 
     # NaN check
     P_batch, R_batch = fix_all_zero_or_nan(P_batch, R_batch, Q_batch, M_batch)
@@ -1224,157 +1086,78 @@ def dion_update_fsdp_tp(
     else:
         Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
 
-    # Apply weight decay
-    torch._foreach_mul_(X, 1 - lr * weight_decay)
-
     # Compute update scale factor
     fan_out = X[0].size(0)
     fan_in = X[0].size(1)
     scaled_lr = ((fan_out / fan_in) ** 0.5) * lr
 
-    # Apply weight update
-    # X = X - scaled_lr * P @ Q.T
+    # Apply weight decay and weight update
+    # X = (1 - lr * weight_decay) * X - scaled_lr * P @ Q.T
     foreach_baddbmm_(
-        X, P_batch, Q_batch, alpha=-scaled_lr, transpose=param_config.is_transposed
+        X,
+        P_batch,
+        Q_batch,
+        alpha=-scaled_lr,
+        beta=1 - lr * weight_decay,
+        transpose=param_config.is_transposed,
     )
 
     # Re-shard and update Q in place
-    Q_new = Q_batch.to(Q_init_dtype).unbind(dim=0)
-    if param_config.Q_sharded_placements is not None:
-        # Sharded Q has shape (n/outer, r/inner)
-        # Unsharded Q has shape (n/outer, r)
-        Q_new = [
-            q.redistribute(placements=param_config.Q_sharded_placements) for q in Q_new
-        ]
-    torch._foreach_copy_(Q, Q_new)
+    update_Q_matrix_(Q, Q_batch, param_config.Q_sharded_placements)
 
 
-def all_reduce_gradient(
-    G: List[Tensor],
+def all_reduce_replicate_mesh(
+    G: Union[Tensor, List[Tensor]],
     replicate_mesh: Optional[DeviceMesh] = None,
     return_dtensor: bool = True,
-) -> List[Tensor]:
+) -> Union[Tensor, List[Tensor]]:
     """
-    All-reduce a list of gradients across replicated data-parallel ranks.
+    All-reduce a tensor or list of tensors across replicated data-parallel ranks.
     """
     if replicate_mesh is None:
         # No data parallelism, return gradients unmodified
         return G
 
-    G_local = funcol.all_reduce_coalesced(
-        to_local(G),
-        reduceOp="avg",
-        group=replicate_mesh,
-    )
+    if isinstance(G, Tensor):
+        # Single tensor
+        result_local = funcol.all_reduce(
+            to_local(G),
+            reduceOp="avg",
+            group=replicate_mesh,
+        )
+    else:
+        # List of tensors, use coalesced all-reduce
+        result_local = funcol.all_reduce_coalesced(
+            to_local(G),
+            reduceOp="avg",
+            group=replicate_mesh,
+        )
+
     if return_dtensor:
-        return dtensor_from_local(G_local, ref=G[0])
+        ref = G if isinstance(G, Tensor) else G[0]
+        return dtensor_from_local(result_local, ref=ref)
     else:
-        return G_local
+        return result_local
 
 
-def all_reduce_partial_tensor(
-    X: Tensor,
-    partial_mesh_dim: Optional[int] = None,
-    replicate_mesh: Optional[DeviceMesh] = None,
-    return_dtensor: bool = True,
-) -> Tensor:
+def tensor_list_to_batch(
+    M: List[Tensor],
+    Q: List[Tensor],
+    is_transposed: bool,
+) -> Tuple[Tensor, Tensor]:
     """
-    All-reduce the result of sharded matrix multiplication.
-
-    If partial_mesh_dim is specified, we assume X is a DTensor
-    with Partial() placement on that mesh dimension.
-
-    If replicate_mesh is specified, we perform an additional all-reduce
-    to average the results across all replicated data-parallel ranks.
+    Convert a list of tensors M and Q into 3D batched tensors.
     """
-    X_local = X.to_local() if isinstance(X, DTensor) else X
-
-    if partial_mesh_dim is not None:
-        assert isinstance(
-            X, DTensor
-        ), "Input must be DTensor when partial_mesh_dim is specified."
-        assert X.placements[partial_mesh_dim].is_partial(), (
-            f"Expected DTensor to be Partial() on mesh dimension {partial_mesh_dim}, "
-            f"but got placements: {X.placements}"
-        )
-        X_local = funcol.all_reduce(
-            X_local,
-            reduceOp="sum",
-            group=(X.device_mesh, partial_mesh_dim),
-        )
-
-    if replicate_mesh is not None:
-        X_local = funcol.all_reduce(
-            X_local,
-            reduceOp="avg",
-            group=replicate_mesh,
-        )
-
-    if return_dtensor and isinstance(X, DTensor):
-        new_placements = list(X.placements)
-        if partial_mesh_dim is not None:
-            new_placements[partial_mesh_dim] = Replicate()
-        return DTensor.from_local(
-            X_local,
-            device_mesh=X.device_mesh,
-            placements=new_placements,
-        )
+    # Transpose the momentum matrices if needed
+    if is_transposed:
+        M_batch = torch.stack([m.mT for m in M])
     else:
-        return X_local
+        M_batch = torch.stack(M)
 
+    # Match dtype of Q and M
+    Q_batch = torch.stack(Q).to(M_batch.dtype)
 
-def reduce_scatter_partial_tensor(
-    X: Tensor,
-    partial_mesh_dim: Optional[int] = None,
-    scatter_dim: int = 0,
-    replicate_mesh: Optional[DeviceMesh] = None,
-    return_dtensor: bool = True,
-) -> Tensor:
-    """
-    Reduce-scatter the result of sharded matrix multiplication.
-
-    If partial_mesh_dim is specified, we assume X is a DTensor
-    with Partial() placement on that mesh dimension.
-    The result will be sharded along the tensor dimension `scatter_dim`.
-
-    If replicate_mesh is specified, we perform an additional all-reduce
-    to average the results across all replicated data-parallel ranks.
-    """
-    X_local = X.to_local() if isinstance(X, DTensor) else X
-
-    if partial_mesh_dim is not None:
-        assert isinstance(
-            X, DTensor
-        ), "Input must be DTensor when partial_mesh_dim is specified."
-        assert X.placements[partial_mesh_dim].is_partial(), (
-            f"Expected DTensor to be Partial() on mesh dimension {partial_mesh_dim}, "
-            f"but got placements: {X.placements}"
-        )
-        X_local = funcol.reduce_scatter_tensor(
-            X_local,
-            reduceOp="sum",
-            scatter_dim=scatter_dim,
-            group=(X.device_mesh, partial_mesh_dim),
-        )
-
-    if replicate_mesh is not None:
-        X_local = funcol.all_reduce(
-            X_local,
-            reduceOp="avg",
-            group=replicate_mesh,
-        )
-
-    if return_dtensor and isinstance(X, DTensor):
-        new_placements = list(X.placements)
-        if partial_mesh_dim is not None:
-            new_placements[partial_mesh_dim] = Shard(scatter_dim)
-        return DTensor.from_local(
-            X_local,
-            device_mesh=X.device_mesh,
-            placements=new_placements,
-        )
-    else:
-        return X_local
+    return M_batch, Q_batch
 
 
 def generate_random_sketch_matrix(
@@ -1388,9 +1171,11 @@ def generate_random_sketch_matrix(
     The sketch matrix S will have shape (batch_size, k, m),
     where k = round(oversample * r) to the next multiple of 128.
     """
-    assert P.ndim == 3, "P must be a 3D batch of matrices"
+    assert P.ndim >= 3, "P must have batch dimension"
 
-    batch_size, m, r = P.shape
+    batch_size = P.shape[:-2]
+    m = P.size(-2)
+    r = P.size(-1)
     k = math.ceil(oversample * r / 128.0) * 128
     std = math.sqrt(1.0 / k)
 
@@ -1401,7 +1186,7 @@ def generate_random_sketch_matrix(
             S_placements[shard_mesh_dim] = Shard(-1)
 
         S = dtensor_randn(
-            (batch_size, k, m),
+            (*batch_size, k, m),
             device_mesh=P.device_mesh,
             dtype=P.dtype,
             placements=S_placements,
@@ -1411,8 +1196,8 @@ def generate_random_sketch_matrix(
     else:
         # Regular tensor case
         if shard_mesh_dim is not None:
-            raise ValueError("Must use DTensor for sharded random sketch.")
-        return torch.empty((batch_size, k, m), device=P.device, dtype=P.dtype).normal_(
+            raise TypeError("Must use DTensor parameters for sharded random sketch.")
+        return torch.empty((*batch_size, k, m), device=P.device, dtype=P.dtype).normal_(
             std=std
         )
 
@@ -1425,12 +1210,11 @@ def qr_dtensor(
     """
     Perform QR decomposition on a DTensor.
     If return_R is True, return the R matrix. Otherwise, return the Q matrix.
-    If out_dtype is specified, the output will be cast to that dtype.
-    Otherwise, the output will be float32.
     """
-    assert isinstance(A, DTensor), "Input must be DTensor"
-    for matrix_dim in (-2, -1):
-        assert A.placements[matrix_dim].is_replicate(), "Must unshard matrix before QR"
+    if isinstance(A, DTensor):
+        # Matrix dimensions (-2, -1) cannot be sharded
+        assert not any(p.is_shard(A.ndim - 2) for p in A.placements)
+        assert not any(p.is_shard(A.ndim - 1) for p in A.placements)
 
     # Torch QR requires float32 precision
     A_local = to_local(A).to(dtype=torch.float32)
@@ -1457,11 +1241,10 @@ def cholesky_dtensor(
     """
     Perform Cholesky decomposition on a DTensor.
     """
-    assert isinstance(A, DTensor), "Input must be DTensor"
-    for matrix_dim in (-2, -1):
-        assert A.placements[
-            matrix_dim
-        ].is_replicate(), "Must unshard matrix before Cholesky"
+    if isinstance(A, DTensor):
+        # Matrix dimensions (-2, -1) cannot be sharded
+        assert not any(p.is_shard(A.ndim - 2) for p in A.placements)
+        assert not any(p.is_shard(A.ndim - 1) for p in A.placements)
 
     # Torch Cholesky requires float32 precision
     A_local = to_local(A).to(dtype=torch.float32)
@@ -1481,11 +1264,12 @@ def solve_triangular_dtensor(
     """
     Solve the linear system Q @ R = A for Q, where R is a triangular matrix.
     """
-    assert isinstance(A, DTensor)
-    assert isinstance(R, DTensor)
-    assert A.placements[-1].is_replicate(), "Last dimension of A cannot be sharded"
-    for matrix_dim in (-2, -1):
-        assert R.placements[matrix_dim].is_replicate(), "R matrix cannot be sharded"
+    if isinstance(A, DTensor):
+        # Matrix dimensions (-2, -1) cannot be sharded for R
+        # Last dimension (-1) cannot be sharded for A
+        assert not any(p.is_shard(R.ndim - 2) for p in R.placements)
+        assert not any(p.is_shard(R.ndim - 1) for p in R.placements)
+        assert not any(p.is_shard(A.ndim - 1) for p in A.placements)
 
     # Convert to local tensors and solve
     A_local = to_local(A).to(dtype=torch.float32)
@@ -1498,19 +1282,140 @@ def solve_triangular_dtensor(
     )
 
 
+# Graph break in torch.compile due to DTensor RNG
+@torch.compile()
+def orthogonalize(P: Tensor, oversample: float = 1.25) -> Tensor:
+    """
+    Orthogonalize a batch of matrices.
+    The input cannot be sharded along the matrix dimensions.
+    If input is DTensor, the output will also be DTensor.
+    """
+    assert P.ndim >= 3, "Expected P to have batch dimension"
+    original_dtype = P.dtype
+    P_local = to_local(P)
+
+    if isinstance(P, DTensor):
+        # Matrix dimensions (-2, -1) cannot be sharded
+        assert not any(p.is_shard(P.ndim - 2) for p in P.placements)
+        assert not any(p.is_shard(P.ndim - 1) for p in P.placements)
+
+    # Standard QR is faster if matrix is square or wide
+    if P.size(-2) <= P.size(-1):
+        P_local, _ = torch.linalg.qr(P_local.to(dtype=torch.float32))
+
+    # Randomized Cholesky QR
+    else:
+        # Must generate random sketch as DTensor for synchronized RNG
+        S = generate_random_sketch_matrix(P, oversample)
+        S_local = to_local(S)
+
+        # Orthogonalize P using random sketch QR
+        SP = S_local @ P_local
+        _, R = torch.linalg.qr(SP.to(dtype=torch.float32), mode="r")
+        P_local = torch.linalg.solve_triangular(
+            R, P_local.to(dtype=torch.float32), upper=True, left=False
+        )
+
+        # Apply Cholesky QR to better orthogonalize
+        PP = P_local.mT @ P_local  # always do float32 matrix multiply
+        R, _ = torch.linalg.cholesky_ex(PP, upper=True)
+        P_local = torch.linalg.solve_triangular(R, P_local, upper=True, left=False)
+
+    return dtensor_from_local(
+        P_local.to(original_dtype).contiguous(),
+        ref=P,
+    )
+
+
+# Graph break in torch.compile due to DTensor RNG
+@torch.compile()
+def distributed_orthogonalize(
+    P: DTensor, oversample: float = 1.25, shard_mesh_dim: Optional[int] = None
+) -> DTensor:
+    """
+    Orthogonalize a batch of sharded matrices.
+    The input cannot be sharded along the last dimension.
+    """
+    assert isinstance(P, DTensor)
+    assert not any(p.is_partial() for p in P.placements)
+    assert not any(p.is_shard(P.ndim - 1) for p in P.placements)
+    assert P.ndim >= 3, "Expected P to have batch dimension"
+    original_dtype = P.dtype
+    original_placements = P.placements
+
+    # Batch-sharded placement shards dimension 0 = batch
+    # Each device gets one full matrix in the batch
+    fully_replicated_placements = [Replicate() for _ in P.placements]
+    batch_sharded_placements = fully_replicated_placements.copy()
+    if shard_mesh_dim is not None:
+        batch_sharded_placements[shard_mesh_dim] = Shard(0)
+
+    # Standard QR is faster if matrix is square or wide
+    if P.size(-2) <= P.size(-1):
+        P_single = P.redistribute(
+            placements=batch_sharded_placements,
+        )  # this should do all-to-all
+
+        # Compute Q matrix of QR decomposition
+        P_single = qr_dtensor(P_single, return_R=False, out_dtype=original_dtype)
+
+        P = P_single.redistribute(
+            placements=original_placements,
+        )  # this should do all-to-all
+
+    # Randomized Cholesky QR
+    else:
+        # Compute the random sketch matrix
+        S = generate_random_sketch_matrix(P, oversample, shard_mesh_dim=shard_mesh_dim)
+        SP: DTensor = S @ P
+        SP_single = SP.redistribute(
+            placements=batch_sharded_placements,
+        )  # this should do reduce-scatter
+
+        # Compute a single R matrix of the batch using QR decomposition
+        R_single = qr_dtensor(SP_single, return_R=True)
+        R = R_single.redistribute(
+            placements=fully_replicated_placements,
+        )  # this should do all-gather
+
+        # Solve for orthogonalized P_batch
+        P = solve_triangular_dtensor(P, R)
+
+        # Apply Cholesky QR to better orthogonalize P_batch
+        PP: DTensor = P.mT @ P
+        PP_single = PP.redistribute(
+            placements=batch_sharded_placements,
+        )  # this should do reduce-scatter
+
+        # Compute a single R matrix of the batch using Cholesky decomposition
+        R_single = cholesky_dtensor(PP_single, upper=True)
+        R = R_single.redistribute(
+            placements=fully_replicated_placements,
+        )  # this should do all-gather
+
+        # Solve for orthogonalized P_batch
+        P = solve_triangular_dtensor(P, R, out_dtype=original_dtype)
+
+    return P
+
+
+@torch.compile(fullgraph=True)
 def fix_all_zero_or_nan(
-    P: Tensor, Q: Tensor, Q_init: Tensor, B: Tensor
+    P: Tensor,  # Output of power iteration
+    R: Tensor,  # Output of power iteration
+    Q_init: Tensor,  # Initial Q matrix
+    B: Tensor,  # Buffer to check if all zeros
 ) -> Tuple[Tensor, Tensor]:
     """
-    If input is all zero, P and Q will be nan or all zero.
+    If input is all zero, P and R will be nan or all zero.
     We want to return the conditional expressions:
 
         if is_all_zero:
             P = torch.zeros_like(P)
-            Q = Q_init
+            R = Q_init
         else:
             P = P
-            Q = Q
+            R = R
 
     Here this is implemented without data-dependent control flow.
     To avoid additional communication, we handle sharded tensors independently.
@@ -1519,25 +1424,27 @@ def fix_all_zero_or_nan(
     is_all_zero = (B_local == 0).all(dim=(-2, -1), keepdim=True)
     not_all_zero = ~is_all_zero
     P_local = to_local(P).nan_to_num() * not_all_zero
-    Q_local = to_local(Q).nan_to_num() * not_all_zero + to_local(Q_init) * is_all_zero
+    R_local = to_local(R).nan_to_num() * not_all_zero + to_local(Q_init) * is_all_zero
     P = dtensor_from_local(P_local, ref=P)
-    Q = dtensor_from_local(Q_local, ref=Q)
-    return P, Q
+    R = dtensor_from_local(R_local, ref=R)
+    return P, R
 
 
+@torch.compile(fullgraph=True)
 def foreach_baddbmm_(
     X: List[Tensor],  # List of 2D matrices (modified in place)
     A: Tensor,  # 3D batch of matrices
     B: Tensor,  # 3D batch of matrices
     alpha: float = 1.0,
+    beta: float = 1.0,
     transpose: bool = False,
 ):
     """
     Perform batch matrix multiplication and in-place addition.
     This is basically a foreach version of torch.baddbmm().
 
-    If transpose is False, we compute X[i] += alpha * (A @ B.mT)[i].
-    If transpose is True, we compute X[i] += alpha * (B @ A.mT)[i].
+    If transpose is False, we compute X[i] = beta * X[i] + alpha * (A @ B.mT)[i].
+    If transpose is True, we compute X[i] = beta * X[i] + alpha * (B @ A.mT)[i].
     """
     assert len(X) == A.size(0), "X must have the same batch size as A"
     assert A.size(0) == B.size(0), "A and B must have the same batch size"
@@ -1547,8 +1454,50 @@ def foreach_baddbmm_(
     else:
         update = B @ A.mT
 
+    # Convert DTensor to local tensor for foreach operations
+    if isinstance(update, DTensor):
+        if any(p.is_partial() for p in update.placements):
+            raise NotImplementedError(
+                "This function does not support DTensor matrix multiplication with Partial() placements."
+            )
+        update = update.to_local()
+        X = to_local(X)
+
     update = update.unbind(dim=0)  # Split batch into list of tensors
-    torch._foreach_add_(X, update, alpha=alpha)
+    update = torch._foreach_mul(update, alpha)  # Scale update by alpha
+    torch._foreach_mul_(X, beta)  # Scale existing X by beta
+    torch._foreach_add_(X, update)
+
+
+@torch.compile(fullgraph=True)
+def update_Q_matrix_(
+    Q: List[Tensor],  # Q matrix for power iteration (modified in place)
+    Q_batch: Tensor,  # New Q matrix from orthogonalization
+    Q_sharded_placements: Optional[Tuple[Placement]] = None,
+):
+    """
+    Update the list of Q matrices in place with the new 3D stacked Q_batch.
+    """
+    if Q_sharded_placements is not None:
+        # Increment all Shard() dimensions by 1 because of the batch dimension
+        assert isinstance(Q_batch, DTensor)
+        Q_batch_sharded_placements = list(Q_sharded_placements)
+
+        for i in range(len(Q_batch_sharded_placements)):
+            if Q_batch_sharded_placements[i].is_shard():
+                Q_batch_sharded_placements[i] = Shard(
+                    Q_batch_sharded_placements[i].dim + 1
+                )
+
+        # Redistribute Q_batch to sharded placements
+        Q_batch = Q_batch.redistribute(
+            placements=Q_batch_sharded_placements,
+        )
+
+    # Match dtype and convert to local tensor
+    Q_init_dtype = Q[0].dtype
+    Q_batch = to_local(Q_batch).to(Q_init_dtype)
+    torch._foreach_copy_(to_local(Q), Q_batch.unbind(dim=0))
 
 
 def adamw_update_allreduce_grad(
@@ -1567,9 +1516,8 @@ def adamw_update_allreduce_grad(
     """
     AdamW optimizer algorithm with gradient all-reduce.
     """
-    G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
+    G = all_reduce_replicate_mesh(G, replicate_mesh, return_dtensor=False)
     yield
-    G = dtensor_from_local(G_local, ref=G[0])
     adamw_update_foreach(X, G, M, V, lr, beta1, beta2, weight_decay, step, epsilon)
 
 
@@ -1586,7 +1534,6 @@ def lion_update_allreduce_grad(
     """
     Lion optimizer algorithm with gradient all-reduce.
     """
-    G_local = all_reduce_gradient(G, replicate_mesh, return_dtensor=False)
+    G = all_reduce_replicate_mesh(G, replicate_mesh, return_dtensor=False)
     yield
-    G = dtensor_from_local(G_local, ref=G[0])
     lion_update_foreach(X, G, M, lr, beta1, beta2, weight_decay)

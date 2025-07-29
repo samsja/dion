@@ -121,7 +121,7 @@ class AsyncRuntime:
     def run(self):
         # Run the event loop until all tasks are completed
         have_new_tasks = True
-        previous_tasks = []
+        previous_tasks: List["AsyncTask"] = []
 
         while have_new_tasks or previous_tasks:
             # See if we can add another task

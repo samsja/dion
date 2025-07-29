@@ -113,7 +113,7 @@ class Muon(Optimizer):
             self._world_size = 1
             self._process_group = None
         else:
-            raise ValueError(
+            raise TypeError(
                 f"Invalid distributed_mesh type: {type(distributed_mesh)}. Expected DeviceMesh or ProcessGroup."
             )
         self._distributed_mesh = distributed_mesh
@@ -121,7 +121,7 @@ class Muon(Optimizer):
         # Newton-Schulz configuration
         if newton_schulz_func is not None:
             if not callable(newton_schulz_func):
-                raise ValueError(
+                raise TypeError(
                     f"newton_schulz_func must be a callable function, got {type(newton_schulz_func)}"
                 )
             self._newton_schulz_func = newton_schulz_func
@@ -223,7 +223,7 @@ class Muon(Optimizer):
                 sharded_tensor_dim = None
                 if isinstance(params[0], DTensor):
                     if not isinstance(self._distributed_mesh, DeviceMesh):
-                        raise ValueError(
+                        raise RuntimeError(
                             "Must create optimizer with DeviceMesh if using DTensor parameters."
                         )
 
@@ -248,7 +248,7 @@ class Muon(Optimizer):
                         and params[0].device_mesh.get_group(sharded_mesh_dim)
                         != self._process_group
                     ):
-                        raise ValueError(
+                        raise RuntimeError(
                             f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
                         )
 
