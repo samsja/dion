@@ -7,4 +7,3 @@ einops
 omegaconf
 datasets
 tiktoken
-lion-pytorch
