@@ -82,6 +82,10 @@ class Dion(Optimizer):
             This may be useful to ensure even sharding.
         lr: Base learning rate. For Dion, this will be scaled based on the matrix dimensions.
             For non-Dion algorithms, this is the actual learning rate and no additional scaling is done.
+        qr_method: Method for computing QR decomposition during orthogonalization.
+            Options are "rcqr" (Randomized Cholesky QR), "cqr" (Cholesky QR), and "qr" (standard QR).
+        cqr_warmup_steps: Number of steps before enabling CQR. Ignored if qr_method is not "cqr".
+        rcqr_oversample: Random sketch oversampling factor for RCQR. Ignored if qr_method is not "rcqr".
 
     Note: We assume parameters are all DTensor or all regular Tensors. All sharded tensors are assumed
     to be uniformly sharded - that is, each device along the sharding axis has identical size shards.
@@ -106,7 +110,9 @@ class Dion(Optimizer):
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
         power_iters: int = 1,  # Number of power iterations for low-rank approximation
-        oversample: float = 1.25,  # For QR random sketch matrix
+        qr_method: str = "rcqr",  # Method for computing QR decomposition
+        cqr_warmup_steps: int = 150,  # Warmup steps before enabling CQR
+        rcqr_oversample: float = 1.25,  # Random sketch matrix oversampling for RCQR
         mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
     ):
         # Check hyperparameters
@@ -124,6 +130,8 @@ class Dion(Optimizer):
             raise ValueError(f"Invalid rank multiple of: {rank_multiple_of}")
         if power_iters <= 0:
             raise ValueError(f"Invalid power iterations: {power_iters}")
+        if qr_method not in ("qr", "cqr", "rcqr"):
+            raise ValueError(f"Unknown QR method: {qr_method}")
 
         # Check device mesh
         if replicate_mesh is not None:
@@ -170,13 +178,15 @@ class Dion(Optimizer):
             beta2=betas[1],
             weight_decay=weight_decay,
             epsilon=epsilon,
-            oversample=oversample,
+            oversample=rcqr_oversample,
             algorithm="dion",
             step=0,
         )
         super().__init__(params, defaults)
 
         self._power_iters = power_iters
+        self._qr_method = qr_method
+        self._cqr_warmup_steps = cqr_warmup_steps
         self._rng = None
 
         # This is intentionally not in self.state so it doesn't get checkpointed
@@ -280,6 +290,11 @@ class Dion(Optimizer):
                         self._rng = torch.Generator(device=param.device)
                         self._rng.manual_seed(0)
 
+                    qr_method = self._qr_method
+                    if qr_method == "cqr" and step <= self._cqr_warmup_steps:
+                        # Enable CQR only after warmup, so matrices are well-conditioned
+                        qr_method = "rcqr"
+
                     Q_new = dion_update(
                         X=param,
                         G=gradient,
@@ -291,6 +306,7 @@ class Dion(Optimizer):
                         epsilon=epsilon,
                         transpose=param_config.is_transposed,
                         power_iters=self._power_iters,
+                        qr_method=qr_method,
                         oversample=oversample,
                         compressed_all_reduce=compressed_all_reduce,
                         replicate_mesh=self._replicate_mesh,
@@ -573,6 +589,7 @@ def dion_update(
     epsilon: float,
     transpose: bool,
     power_iters: int,
+    qr_method: str,  # Method for computing QR decomposition
     oversample: float = 1.25,
     compressed_all_reduce: bool = True,
     replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
@@ -595,6 +612,7 @@ def dion_update(
         M.T if transpose else M,
         Q,
         power_iters=power_iters,
+        qr_method=qr_method,
         oversample=oversample,
         compressed_all_reduce=compressed_all_reduce,
         replicate_mesh=replicate_mesh,
@@ -637,8 +655,9 @@ def power_iteration(
     B: Tensor,
     Q_init: Tensor,
     power_iters: int,
-    oversample: float,
-    compressed_all_reduce: bool,
+    qr_method: str,  # Method for computing QR decomposition
+    oversample: float,  # Oversampling factor for RCQR
+    compressed_all_reduce: bool,  # Whether to all-reduce low-rank P and Q
     replicate_mesh: Union[DeviceMesh, ProcessGroup, None] = None,
     inner_shard_mesh_dim: Optional[int] = None,  # for DTensor only
     rng: Optional[torch.Generator] = None,  # for regular tensor only
@@ -659,11 +678,14 @@ def power_iteration(
             P = all_reduce(P, replicate_mesh)
 
         if isinstance(P, DTensor):
-            P = orthogonalize_dtensor(
-                P, oversample, shard_mesh_dim=inner_shard_mesh_dim
+            P = distributed_orthogonalize(
+                P,
+                qr_method=qr_method,
+                oversample=oversample,
+                shard_mesh_dim=inner_shard_mesh_dim,
             )
         else:
-            P = orthogonalize(P, oversample, rng=rng)
+            P = orthogonalize(P, qr_method=qr_method, oversample=oversample, rng=rng)
 
         Q = B.T @ P
         if compressed_all_reduce:
@@ -674,22 +696,33 @@ def power_iteration(
 
 def orthogonalize(
     P: Tensor,
+    qr_method: str = "rcqr",
     oversample: float = 1.25,
     rng: Optional[torch.Generator] = None,
 ) -> Tensor:
     """
     Orthogonalize a matrix P using Randomized Cholesky QR.
     """
-    assert not isinstance(P, DTensor), "Use orthogonalize_dtensor instead"
+    assert qr_method in ("qr", "cqr", "rcqr"), f"Unknown method: {qr_method}"
+    assert not isinstance(P, DTensor), "Use distributed_orthogonalize() instead"
+
     m, n = P.shape
     P_dtype = P.dtype
 
-    # Standard QR is faster if matrix is square or wide
-    if m <= n:
+    # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
+    if qr_method == "cqr":
+        R, info = torch.linalg.cholesky_ex(P.T @ P, upper=True)
+        if info == 0:
+            Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
+        else:
+            qr_method = "rcqr"  # Fallback to randomized QR
+
+    # Standard QR is faster than RCQR if matrix is square or wide
+    if qr_method == "qr" or (qr_method == "rcqr" and m <= n):
         Q, _ = torch.linalg.qr(P.to(dtype=torch.float32))
 
     # Randomized Cholesky QR
-    else:
+    if qr_method == "rcqr" and m > n:
         # Compute size k and round up to next multiple of 128
         m, n = P.shape
         k = math.ceil(oversample * n / 128.0) * 128
@@ -716,8 +749,9 @@ def orthogonalize(
     return Q.to(dtype=P_dtype)
 
 
-def orthogonalize_dtensor(
+def distributed_orthogonalize(
     P: DTensor,
+    qr_method: str = "rcqr",
     oversample: float = 1.25,
     shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
@@ -728,6 +762,9 @@ def orthogonalize_dtensor(
     assumed to have Shard(0) placement (row-sharded along size-m tensor dimension).
     The orthogonalized output will have the same shape and sharding as the input P.
     """
+    assert qr_method in ("qr", "cqr", "rcqr"), f"Unknown method: {qr_method}"
+    assert isinstance(P, DTensor), "Use orthogonalize() for regular tensors"
+
     # Get desired placements for output
     m, r = P.shape
     P_dtype = P.dtype
@@ -735,19 +772,39 @@ def orthogonalize_dtensor(
     if shard_mesh_dim is not None:
         placements[shard_mesh_dim] = Shard(0)  # Shard(0) = rows
 
-    # Standard QR is faster if matrix is square or wide
-    if m <= r:
+    # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
+    if qr_method == "cqr":
+        PP: DTensor = P.T @ P
+        PP_full = PP.full_tensor().to(dtype=torch.float32)
+        R_full, info = torch.linalg.cholesky_ex(PP_full, upper=True)
+
+        if info == 0:
+            P_local = (
+                P.redistribute(placements=placements).to_local().to(dtype=torch.float32)
+            )
+            Q_local = torch.linalg.solve_triangular(
+                R_full, P_local, upper=True, left=False
+            )
+            Q = DTensor.from_local(
+                Q_local.to(dtype=P_dtype),  # cast back to original dtype
+                device_mesh=P.device_mesh,
+                placements=placements,
+            )
+        else:
+            qr_method = "rcqr"  # Fallback to randomized QR
+
+    # Standard QR is faster than RCQR if matrix is square or wide
+    if qr_method == "qr" or (qr_method == "rcqr" and m <= r):
         # Fully unshard for QR
         P_full = P.full_tensor().to(dtype=torch.float32)
         Q_full, _ = torch.linalg.qr(P_full)
         Q = DTensor.from_local(
             Q_full.to(dtype=P_dtype),
             device_mesh=P.device_mesh,
-            run_check=False,
         ).redistribute(placements=placements)
 
     # Randomized Cholesky QR
-    else:
+    if qr_method == "rcqr" and m > r:
         # Apply random sketch to input matrix
         S = generate_random_sketch_dtensor(
             P, oversample=oversample, shard_mesh_dim=shard_mesh_dim
@@ -765,7 +822,6 @@ def orthogonalize_dtensor(
             Q_local,  # dtype is float32
             device_mesh=P.device_mesh,
             placements=placements,
-            run_check=False,
         )
 
         # Apply another iteration of Cholesky QR to better orthogonalize Q
@@ -777,7 +833,6 @@ def orthogonalize_dtensor(
             Q_local.to(dtype=P_dtype),  # cast back to original dtype
             device_mesh=P.device_mesh,
             placements=placements,
-            run_check=False,
         )
 
     return Q
@@ -874,7 +929,6 @@ def all_reduce(
             tensor_local,
             device_mesh=tensor.device_mesh,
             placements=tensor.placements,
-            run_check=False,
         )
 
     else:

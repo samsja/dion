@@ -117,7 +117,9 @@ class Dion(Optimizer):
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
         power_iters: int = 1,  # Number of power iterations for low-rank approximation
-        oversample: float = 1.25,  # For QR random sketch matrix
+        qr_method: str = "rcqr",  # Method for computing QR decomposition
+        cqr_warmup_steps: int = 150,  # (ignored)
+        rcqr_oversample: float = 1.25,  # For QR random sketch matrix
         mixed_precision_config: Optional[DionMixedPrecisionConfig] = None,
     ):
         # Check hyperparameters
@@ -135,6 +137,8 @@ class Dion(Optimizer):
             raise ValueError(f"Invalid rank multiple of: {rank_multiple_of}")
         if power_iters != 1:
             raise ValueError("Async Dion only supports power_iters=1")
+        if qr_method != "rcqr":
+            raise ValueError("Async Dion only supports qr_method='rcqr'")
 
         # Check device mesh
         if replicate_mesh is not None:
@@ -181,7 +185,7 @@ class Dion(Optimizer):
             beta2=betas[1],
             weight_decay=weight_decay,
             epsilon=epsilon,
-            oversample=oversample,
+            oversample=rcqr_oversample,
             algorithm="dion",
             step=0,
         )

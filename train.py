@@ -62,10 +62,10 @@ class Hyperparameters:
     rank_fraction: float = 0.125
 
     # Optimizer specific hyperparameters
-    oversample: float = 1.25  # for Dion only
-    qr_warmup: float = 0.05  # for DionReference only
-    approx_method: str = "qr"  # for DionReference only
-    efficient: bool = False  # for DionReference only
+    qr_method: str = "qr"
+    cqr_warmup: float = 0.05
+    rcqr_oversample: float = 1.25
+    efficient: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
 
 
@@ -120,6 +120,9 @@ def parse_cli_args():
         type=int,
         default=None,
         help="Sparsity level for the optimizer",
+    )
+    parser.add_argument(
+        "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
     )
 
     # ---------- model ----------
@@ -321,6 +324,7 @@ def init_optimizer(
 
     if hp.optimizer == "dion":
         print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion QR method: {hp.qr_method}")
         print0(f"Compressed data-parallel gradient sync: {cli_args.opt_grad_sync}")
         opt = Dion(
             param_groups,
@@ -332,7 +336,9 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            oversample=hp.oversample,
+            qr_method=hp.qr_method,
+            cqr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
+            rcqr_oversample=hp.rcqr_oversample,
         )
 
     elif hp.optimizer == "dion_async":
@@ -348,7 +354,9 @@ def init_optimizer(
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            oversample=hp.oversample,
+            qr_method=hp.qr_method,
+            cqr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
+            rcqr_oversample=hp.rcqr_oversample,
         )
 
     elif hp.optimizer == "muon":
@@ -380,7 +388,7 @@ def init_optimizer(
 
     elif hp.optimizer == "dion_reference":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
-        assert hp.approx_method is not None
+        assert hp.qr_method is not None
         print0(f"Dion rank fraction: {hp.rank_fraction}")
         if hp.efficient == True:
             assert hp.rank_fraction <= 0.5, (
@@ -393,8 +401,8 @@ def init_optimizer(
             mu=hp.mu,
             weight_decay=hp.weight_decay,
             rank=round(hp.rank_fraction * hp.model_dim),
-            approx_method=hp.approx_method,
-            qr_warmup_steps=round(hp.qr_warmup * hp.num_iterations),
+            qr_method=hp.qr_method,
+            qr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
             efficient=hp.efficient,
         )
 
