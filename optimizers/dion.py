@@ -629,7 +629,7 @@ def dion_update(
         M.add_(R @ P.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
-    # DTensor will automatically sync the full-tensor norm
+    # For sharded matrices, DTensor will automatically sync the full-tensor norm
     Q = R / (R.norm(dim=0, keepdim=True) + epsilon)
 
     # Apply weight decay
@@ -701,7 +701,10 @@ def orthogonalize(
     rng: Optional[torch.Generator] = None,
 ) -> Tensor:
     """
-    Orthogonalize a matrix P using Randomized Cholesky QR.
+    Orthogonalize the input matrix using the specified method.
+        - "qr": Householder QR (torch.linalg.qr)
+        - "cqr": Cholesky QR
+        - "rcqr": Randomized Cholesky QR
     """
     assert qr_method in ("qr", "cqr", "rcqr"), f"Unknown method: {qr_method}"
     assert not isinstance(P, DTensor), "Use distributed_orthogonalize() instead"
@@ -756,11 +759,18 @@ def distributed_orthogonalize(
     shard_mesh_dim: Optional[int] = None,
 ) -> DTensor:
     """
-    Orthogonalize a matrix P of type DTensor using randomized QR.
+    Orthogonalize the input matrix using the specified method.
+        - "qr": Householder QR (torch.linalg.qr)
+        - "cqr": Cholesky QR
+        - "rcqr": Randomized Cholesky QR
 
     P has shape (m, r) and can be sharded on shard_mesh_dim. If sharded, it is
     assumed to have Shard(0) placement (row-sharded along size-m tensor dimension).
     The orthogonalized output will have the same shape and sharding as the input P.
+
+    Methods "rcqr" and "cqr" can work directly with sharded matrices.
+    The "qr" method will unshard the full matrix before computing QR.
+    The "cqr" method is faster than "rcqr" but is not numerically stable.
     """
     assert qr_method in ("qr", "cqr", "rcqr"), f"Unknown method: {qr_method}"
     assert isinstance(P, DTensor), "Use orthogonalize() for regular tensors"
