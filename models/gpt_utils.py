@@ -38,9 +38,9 @@ def _load_data_shard(filename):
 
 
 class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
+    def __init__(self, filename_pattern, B, T, dp_rank, dp_world_size):
+        self.dp_rank = dp_rank
+        self.dp_world_size = dp_world_size
         self.B = B
         self.T = T
 
@@ -51,7 +51,7 @@ class DistributedDataLoader:
         ), f"did not find any files that match the pattern {filename_pattern}"
 
         # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
+        # ntok_total = 0
         # for fname in self.files:
         #     shard_ntok = _peek_data_shard(fname)
         #     assert shard_ntok >= num_processes * B * T + 1
@@ -62,15 +62,18 @@ class DistributedDataLoader:
         # kick things off
         self.reset()
 
+    def _load_tokens_for_current_shard(self):
+        self.tokens = _load_data_shard(self.files[self.current_shard])
+
     def reset(self):
         self.current_shard = 0
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.dp_rank * self.B * self.T
+        self._load_tokens_for_current_shard()
 
     def advance(self):  # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+        self.current_position = self.dp_rank * self.B * self.T
+        self._load_tokens_for_current_shard()
 
     def next_batch(self):
         B = self.B
@@ -80,32 +83,32 @@ class DistributedDataLoader:
         x = (buf[:-1]).view(B, T)  # inputs
         y = (buf[1:]).view(B, T)  # targets
         # advance current position and load next shard if necessary
-        self.current_position += B * T * self.num_processes
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
+        self.current_position += B * T * self.dp_world_size
+        if self.current_position + (B * T * self.dp_world_size + 1) > len(self.tokens):
             self.advance()
         return x.cuda(), y.cuda()
 
-    def get_state_dict(self):
+    def state_dict(self):
         # return the state dict for the current shard
         return {
-            "current_shard": self.current_shard,
-            "current_position": self.current_position,
-            "tokens": self.tokens,
+            f"current_shard_rank_{self.dp_rank}": self.current_shard,
+            f"current_position_rank_{self.dp_rank}": self.current_position,
+            "dataloader_world_size": self.dp_world_size,
         }
 
-    def load_state_dict(self, state_dict):
-        # Load the state saved by rank 0.
-        self.current_shard = state_dict["current_shard"]
-        base_position = state_dict["current_position"]
-        self.tokens = state_dict["tokens"]
+    def load_state_dict(self, state_dict: dict):
+        # Check that state_dict has the right world size
+        state_dict_world_size = state_dict.get("dataloader_world_size")
+        if state_dict_world_size != self.dp_world_size:
+            raise NotImplementedError(
+                f"DistributedDataLoader does not support redistributing checkpoints to a different world size. "
+                f"Current process has world size {self.dp_world_size}, but checkpoint has {state_dict_world_size}."
+            )
 
-        # Shift the base position by an offset that depends on process_rank.
-        self.current_position = base_position + self.process_rank * self.B * self.T
-
-        # Check if the new position is valid within the current shard.
-        if self.current_position + (self.B * self.T + 1) > len(self.tokens):
-            while self.current_position + (self.B * self.T + 1) > len(self.tokens):
-                self.advance()  # Advance to next shard and set position
+        # Load the state
+        self.current_shard = state_dict[f"current_shard_rank_{self.dp_rank}"]
+        self.current_position = state_dict[f"current_position_rank_{self.dp_rank}"]
+        self._load_tokens_for_current_shard()
 
 
 class ArithmeticDistributedDataLoader:

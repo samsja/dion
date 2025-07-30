@@ -1,14 +1,18 @@
 import argparse
 import math
 import os
+import shutil
 import time
+import tempfile
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 import wandb
 import yaml
 
 from dataclasses import dataclass
 from pathlib import Path
+from torch.distributed.checkpoint.state_dict import get_state_dict, set_state_dict
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DeviceMesh
@@ -30,7 +34,6 @@ from optimizers.muon_reference import Muon as MuonReference
 class Hyperparameters:
     # Data directory
     data_dir: str = "data/fineweb10B"
-    output: str = "output"  # output directory
 
     # Training config
     batch_size: int = 8 * 64  # global batch size (across devices)
@@ -48,7 +51,8 @@ class Hyperparameters:
     # Evaluation and logging
     val_loss_every: int = 125
     val_tokens: int = 10485760
-    save_every: int = 0
+    checkpoint_freq: int = 0
+    checkpoint_dir: str = None
     wandb_project_name: str = "dion-test"
 
     # Optimizer
@@ -87,7 +91,6 @@ def parse_cli_args():
         help="Path to a YAML file whose keys match train.py flags "
         "(CLI values always override the YAML).",
     )
-
     parser.add_argument(
         "--data_dir",
         type=str,
@@ -95,10 +98,16 @@ def parse_cli_args():
         help="Directory that contains fineweb_train_*.bin and fineweb_val_*.bin",
     )
     parser.add_argument(
-        "--output",
+        "--checkpoint_dir",
         type=str,
         default=None,
-        help="Directory where logs and checkpoints will be saved",
+        help="Directory to load and save checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint_freq",
+        type=int,
+        default=0,
+        help="Checkpoint every N steps, 0 to disable",
     )
 
     # ---------- optimizer ----------
@@ -455,13 +464,115 @@ def init_optimizer(
     return opt
 
 
+class CheckpointManager:
+    def __init__(
+        self,
+        checkpoint_dir: str,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        train_loader: DistributedDataLoader,
+        val_loader: DistributedDataLoader,
+        wandb_id: Optional[str] = None,
+    ):
+        self.checkpoint_dir = checkpoint_dir
+        self.model = model
+        self.optimizer = optimizer
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.wandb_id = wandb_id
+        self.step = None
+        self.DEFAULT_NAME = "checkpoint"
+
+    def _get_state_dict(self) -> dict:
+        # Use get_state_dict() instead of directly calling model.state_dict() etc.
+        # This standardizes state dict for model and optimizer regardless of sharding
+        model_state, opt_state = get_state_dict(self.model, self.optimizer)
+        state_dict = {
+            "model": model_state,
+            "optimizer": opt_state,
+            "train_loader": self.train_loader.state_dict(),
+            "val_loader": self.val_loader.state_dict(),
+            "step": self.step,
+            "wandb_id": self.wandb_id,
+        }
+        return state_dict
+
+    def save(self, name: Optional[str] = None, step: Optional[int] = None):
+        """
+        Save the checkpoint to the path "self.checkpoint_dir/name/".
+        The distributed checkpoint is a directory with sharded files.
+        """
+        assert self.checkpoint_dir, "Checkpoint directory must be specified"
+        self.step = step
+        name = name or self.DEFAULT_NAME
+        checkpoint_path = os.path.join(self.checkpoint_dir, name)
+        os.makedirs(checkpoint_path, exist_ok=True)
+
+        state_dict = self._get_state_dict()
+
+        # Save to a temporary subdirectory first
+        with tempfile.TemporaryDirectory(
+            dir=self.checkpoint_dir, ignore_cleanup_errors=True
+        ) as tmpdir:
+            print0(f"Saving checkpoint to {checkpoint_path}")
+            dcp.save(state_dict, checkpoint_id=tmpdir)
+
+            # Delete any existing checkpoint with the same name
+            if os.path.isfile(checkpoint_path):
+                os.remove(checkpoint_path)
+            elif os.path.isdir(checkpoint_path):
+                shutil.rmtree(checkpoint_path, ignore_errors=True)
+
+            # Move the checkpoint to the final location
+            shutil.move(tmpdir, checkpoint_path)
+
+    def load(self, name: Optional[str] = None, allow_missing: bool = False):
+        """
+        Load the checkpoint from the path "self.checkpoint_dir/name/".
+        """
+        assert self.checkpoint_dir, "Checkpoint directory must be specified"
+        name = name or self.DEFAULT_NAME
+        checkpoint_path = os.path.join(self.checkpoint_dir, name)
+
+        if not os.path.isdir(checkpoint_path):
+            if allow_missing:
+                print0(f"Checkpoint {checkpoint_path} does not exist, skipping load")
+                return
+            raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist")
+
+        print0(f"Loading checkpoint from {checkpoint_path}")
+        state_dict = self._get_state_dict()
+        dcp.load(state_dict, checkpoint_id=checkpoint_path)
+
+        # Load model and optimizer state dicts
+        set_state_dict(
+            self.model,
+            self.optimizer,
+            model_state_dict=state_dict["model"],
+            optim_state_dict=state_dict["optimizer"],
+        )
+
+        # Load train and validation dataloader states
+        self.train_loader.load_state_dict(state_dict["train_loader"])
+        self.val_loader.load_state_dict(state_dict["val_loader"])
+
+        self.step = state_dict["step"]
+        self.wandb_id = state_dict["wandb_id"]
+
+
 def main():
     # --- Parse command line arguments and set hyperparams ---
     cli_args = parse_cli_args()
     hp = Hyperparameters()
     hp = override_args_from_cli(hp, cli_args)
+
     if cli_args.inv_rank_fraction:
         hp.rank_fraction = 1.0 / cli_args.inv_rank_fraction
+
+    if hp.checkpoint_freq > 0:
+        if not hp.checkpoint_dir:
+            raise ValueError("Must specify --checkpoint_dir to save checkpoints")
+        os.makedirs(hp.checkpoint_dir, exist_ok=True)
 
     # --- Distributed training initialization ---
     device_mesh = init_distributed(
@@ -470,36 +581,6 @@ def main():
         tp_size=cli_args.tp_size,
     )
     print0("=" * 80)
-
-    # --- Logging and wandb initialization ---
-    # Load hyperparameters and update with CLI arguments
-    # Create a name to identify this run
-    opt_name = f"{hp.optimizer}+{hp.scalar_opt}"
-    run_name = f"({opt_name})_bs={hp.batch_size}_lr={hp.lr}"
-    if "dion" in hp.optimizer:
-        run_name += f"_sp={hp.rank_fraction}"
-        if hp.efficient:
-            run_name += f"_eff=True"
-    if cli_args.dp_size is not None:
-        run_name += (
-            f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
-        )
-    if cli_args.wandb_job_name:
-        run_name += f"_{cli_args.wandb_job_name}"
-
-    # Initialize wandb
-    if MASTER_PROCESS and not cli_args.no_wandb:
-        assert hp.wandb_project_name, "wandb project name is required"
-        if not cli_args.debug:
-            wandb.login(
-                key=os.environ.get("WANDB_API_KEY"),
-                host=os.environ.get("WANDB_HOST"),
-                timeout=0,
-            )
-            wandb.init(project=hp.wandb_project_name, name=run_name, config=hp.__dict__)
-
-    print0(f"Run name: {run_name}")
-    print0(f"Debug mode: {cli_args.debug}")
 
     # --- DataLoader Setup ---
     if device_mesh is not None:
@@ -655,6 +736,78 @@ def main():
 
     print0("=" * 80)
 
+    # --- Logging initialization ---
+    # Load hyperparameters and update with CLI arguments
+    # Create a name to identify this run
+    opt_name = f"{hp.optimizer}+{hp.scalar_opt}"
+    run_name = f"({opt_name})_bs={hp.batch_size}_lr={hp.lr}"
+    if "dion" in hp.optimizer:
+        run_name += f"_sp={hp.rank_fraction}"
+        if hp.efficient:
+            run_name += f"_eff=True"
+    if cli_args.dp_size is not None:
+        run_name += (
+            f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}"
+        )
+    if cli_args.wandb_job_name:
+        run_name += f"_{cli_args.wandb_job_name}"
+
+    # --- Set up checkpointing ---
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir=hp.checkpoint_dir,
+        model=model,
+        optimizer=optimizer,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        wandb_id=None,
+    )
+
+    print0(f"Run name: {run_name}")
+    print0(f"Debug mode: {cli_args.debug}")
+    print0(f"Checkpoint directory: {hp.checkpoint_dir}")
+    print0(
+        f"Checkpoint frequency: {hp.checkpoint_freq if hp.checkpoint_freq > 0 else 'disabled'}"
+    )
+
+    # Load the latest checkpoint if it exists
+    if hp.checkpoint_dir:
+        checkpoint_manager.load(allow_missing=True)
+        if checkpoint_manager.step is not None:
+            print0(f"Resuming from step {checkpoint_manager.step}")
+        else:
+            print0("No previous checkpoint found, training model from scratch")
+    else:
+        print0("Training model from scratch")
+
+    print0("=" * 80)
+
+    # --- WandB initialization ---
+    if MASTER_PROCESS and not cli_args.no_wandb:
+        assert hp.wandb_project_name, "wandb project name is required"
+        if not cli_args.debug:
+            wandb_id = checkpoint_manager.wandb_id
+            resume = "must" if wandb_id else "never"
+            wandb.login(
+                key=os.environ.get("WANDB_API_KEY"),
+                host=os.environ.get("WANDB_HOST"),
+                timeout=0,
+            )
+            wandb.init(
+                project=hp.wandb_project_name,
+                name=run_name,
+                config=hp.__dict__,
+                id=wandb_id,
+                resume=resume,
+            )
+            checkpoint_manager.wandb_id = wandb.run.id
+
+    if not cli_args.no_wandb and not cli_args.debug:
+        # Broadcast wandb_id to all processes
+        # Do this to ensure consistency of distributed checkpoint
+        obj_list = [checkpoint_manager.wandb_id]
+        dist.broadcast_object_list(obj_list, src=0)
+        checkpoint_manager.wandb_id = obj_list[0]
+
     # --- Training Loop ---
     x, y = train_loader.next_batch()
     training_time_ms = 0
@@ -664,8 +817,10 @@ def main():
     # Use autocast for mixed precision
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 
+    start_step = 0 if checkpoint_manager.step is None else checkpoint_manager.step + 1
     pbar = tqdm(total=hp.num_iterations, desc="Training", disable=not MASTER_PROCESS)
-    for step in range(hp.num_iterations + 1):
+    pbar.update(start_step)
+    for step in range(start_step, hp.num_iterations + 1):
         # Skip the first few steps for timing to avoid torch.compile overhead
         if step == 10:
             training_time_ms = 0
@@ -760,7 +915,7 @@ def main():
                 {
                     "train/loss": train_loss.item(),
                     "train/grad_norm": grad_norm.item(),
-                    "step": step + 1,
+                    "step": step,
                     "time/training_time_ms": approx_time,  # Log approximate elapsed training time in ms
                 }
             )
@@ -770,6 +925,11 @@ def main():
             )
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
+
+        # Save checkpoint
+        if hp.checkpoint_freq > 0 and step % hp.checkpoint_freq == 0 and step > 0:
+            checkpoint_manager.save(step=step)
+
         torch.cuda.synchronize()
         t0 = time.time()  # reset timer after optimizer step
 
