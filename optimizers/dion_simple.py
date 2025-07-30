@@ -10,18 +10,19 @@ from .scalar_opts import adamw_update, lion_update
 @torch.compile()
 def dion_update(
     X: Tensor,  # Model weights (modified in place)
+    G: Tensor,  # Gradient
     M: Tensor,  # Momentum buffer (modified in place)
     Q: Tensor,  # Q matrix for power iteration (modified in place)
-    lr: Tensor,  # Learning rate (scalar tensor)
-    mu: Tensor,  # Momentum factor (scalar tensor)
-    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    lr: float,  # Learning rate
+    mu: float,  # Momentum factor
+    weight_decay: float,
     epsilon: float = 1e-8,
 ):
     """
     Dion optimizer algorithm.
     """
     # Add new gradient to momentum
-    M.add_(X.grad)
+    M.add_(G)
 
     # Compute low-rank approximation of M = P @ Q^T
     P = M @ Q
@@ -45,6 +46,7 @@ def dion_update(
     X.mul_(1 - weight_decay * lr)
 
     # Apply the weight update
+    # X = X - scaled_lr * (P @ Q.T)
     X.addmm_(P, Q.T, alpha=-scaled_lr)
 
 
@@ -84,15 +86,6 @@ class Dion(Optimizer):
         self.rank = rank
         self.epsilon = torch.tensor(epsilon)
 
-        print(
-            f"Dion optimizer initialized with:\n"
-            f"  - Learning rate: {lr}\n"
-            f"  - Momentum factor (mu): {mu}\n"
-            f"  - Weight decay: {weight_decay}\n"
-            f"  - Rank: {rank}\n"
-            f"  - Epsilon: {epsilon}\n"
-        )
-
         # Check that all Dion parameters are 2D tensors
         for group in self.param_groups:
             if group["algorithm"] == "dion":
@@ -102,8 +95,8 @@ class Dion(Optimizer):
                             f"Expected Dion parameters to be 2D tensor, but got {p.dim()}D."
                         )
                     if isinstance(p, DTensor):
-                        raise ValueError(
-                            "Dion optimizer does not support distributed tensors."
+                        raise NotImplementedError(
+                            "This version of Dion optimizer does not support distributed tensors."
                         )
 
     @torch.no_grad()
@@ -128,7 +121,7 @@ class Dion(Optimizer):
             if algo == "dion":
                 for param in group["params"]:
                     if param.grad is None:
-                        raise ValueError("Gradient is None.")
+                        continue
 
                     # Get optimizer state for this parameter
                     state = self.state[param]
@@ -138,6 +131,7 @@ class Dion(Optimizer):
                     # Apply update
                     dion_update(
                         X=param,
+                        G=param.grad,
                         M=state["momentum"],
                         Q=state["Q"],
                         lr=lr,
@@ -149,7 +143,7 @@ class Dion(Optimizer):
             elif algo == "adamw":
                 for param in group["params"]:
                     if param.grad is None:
-                        raise ValueError("Gradient is None.")
+                        continue
 
                     # Get optimizer state for this parameter
                     state = self.state[param]
@@ -173,7 +167,7 @@ class Dion(Optimizer):
             elif algo == "lion":
                 for param in group["params"]:
                     if param.grad is None:
-                        raise ValueError("Gradient is None.")
+                        continue
 
                     # Get optimizer state for this parameter
                     state = self.state[param]
