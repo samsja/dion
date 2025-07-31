@@ -506,25 +506,33 @@ class CheckpointManager:
         self.step = step
         name = name or self.DEFAULT_NAME
         checkpoint_path = os.path.join(self.checkpoint_dir, name)
-        os.makedirs(checkpoint_path, exist_ok=True)
-
-        state_dict = self._get_state_dict()
+        print0(f"Saving checkpoint to {checkpoint_path}")
 
         # Save to a temporary subdirectory first
-        with tempfile.TemporaryDirectory(
-            dir=self.checkpoint_dir, ignore_cleanup_errors=True
-        ) as tmpdir:
-            print0(f"Saving checkpoint to {checkpoint_path}")
-            dcp.save(state_dict, checkpoint_id=tmpdir)
+        tmpdir = None
+        if dist.get_rank() == 0:
+            os.makedirs(self.checkpoint_dir, exist_ok=True)
+            tmpdir = tempfile.mkdtemp(dir=self.checkpoint_dir)
 
+        # Broadcast tmpdir from rank 0 to all ranks
+        obj_list = [tmpdir]
+        dist.broadcast_object_list(obj_list, src=0)
+        tmpdir = obj_list[0]
+
+        # Save the checkpoint
+        state_dict = self._get_state_dict()
+        dcp.save(state_dict, checkpoint_id=tmpdir)
+        dist.barrier()
+
+        if dist.get_rank() == 0:
             # Delete any existing checkpoint with the same name
             if os.path.isfile(checkpoint_path):
                 os.remove(checkpoint_path)
             elif os.path.isdir(checkpoint_path):
                 shutil.rmtree(checkpoint_path, ignore_errors=True)
-
             # Move the checkpoint to the final location
             shutil.move(tmpdir, checkpoint_path)
+        dist.barrier()
 
     def load(self, name: Optional[str] = None, allow_missing: bool = False):
         """
@@ -558,6 +566,7 @@ class CheckpointManager:
 
         self.step = state_dict["step"]
         self.wandb_id = state_dict["wandb_id"]
+        dist.barrier()
 
 
 def main():
@@ -572,7 +581,6 @@ def main():
     if hp.checkpoint_freq > 0:
         if not hp.checkpoint_dir:
             raise ValueError("Must specify --checkpoint_dir to save checkpoints")
-        os.makedirs(hp.checkpoint_dir, exist_ok=True)
 
     # --- Distributed training initialization ---
     device_mesh = init_distributed(
@@ -926,7 +934,7 @@ def main():
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
 
-        # Save checkpoint
+        # Save distributed checkpoint
         if hp.checkpoint_freq > 0 and step % hp.checkpoint_freq == 0 and step > 0:
             checkpoint_manager.save(step=step)
 
