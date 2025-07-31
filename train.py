@@ -1,3 +1,4 @@
+
 import argparse
 import math
 import os
@@ -571,6 +572,7 @@ class CheckpointManager:
 
 
 def main():
+    torch._dynamo.config.cache_size_limit = 100
     # --- Parse command line arguments and set hyperparams ---
     cli_args = parse_cli_args()
     hp = Hyperparameters()
@@ -744,7 +746,7 @@ def main():
     # --- Logging initialization ---
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
-    opt_name = f"{hp.optimizer}+{hp.scalar_opt}"
+    opt_name = f"{hp.optimizer}+{hp.scalar_opt}_optsync={cli_args.opt_grad_sync}"
     run_name = f"({opt_name})_bs={hp.batch_size}_lr={hp.lr}"
     if "dion" in hp.optimizer:
         run_name += f"_sp={hp.rank_fraction}"
