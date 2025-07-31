@@ -20,7 +20,7 @@ lm_head_params= list(model.lm_head.parameters())
 
 param_groups = [
     dict(params=matrix_params),                         # Dion defaults
-    dict(params=embed_params,
+    dict(params=embed_params,                           # lion for scalar/vector params
          algorithm="lion", lr=base_lr, weight_decay=0),
     dict(params=lm_head_params,
          algorithm="lion",
@@ -28,7 +28,7 @@ param_groups = [
          weight_decay=0),
 ]
 ```
-- Every group inherits defaults unless overridden.
+- Every group inherits defaults (`algorithm="dion"`) unless overridden.
 - Supply `algorithm`, `lr`, `betas`, `weight_decay` only when they deviate.
 
 ## 2. Choosing Device Meshes
