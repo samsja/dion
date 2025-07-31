@@ -46,18 +46,10 @@ class DistributedDataLoader:
 
         # glob files that match the pattern
         self.files = sorted(glob.glob(filename_pattern))
-        assert (
-            len(self.files) > 0
-        ), f"did not find any files that match the pattern {filename_pattern}"
-
-        # load and validate all data shards, count number of tokens in total
-        # ntok_total = 0
-        # for fname in self.files:
-        #     shard_ntok = _peek_data_shard(fname)
-        #     assert shard_ntok >= num_processes * B * T + 1
-        #     ntok_total += int(shard_ntok)
-        # self.ntok_total = ntok_total
-        self.ntok_total = 1300000000000
+        if len(self.files) < 1:
+            raise FileNotFoundError(
+                f"Could not find any files matching the pattern {filename_pattern}"
+            )
 
         # kick things off
         self.reset()
@@ -70,7 +62,8 @@ class DistributedDataLoader:
         self.current_position = self.dp_rank * self.B * self.T
         self._load_tokens_for_current_shard()
 
-    def advance(self):  # advance to next data shard
+    def advance(self):
+        # advance to next data shard
         self.current_shard = (self.current_shard + 1) % len(self.files)
         self.current_position = self.dp_rank * self.B * self.T
         self._load_tokens_for_current_shard()
@@ -102,7 +95,7 @@ class DistributedDataLoader:
         if state_dict_world_size != self.dp_world_size:
             raise NotImplementedError(
                 f"DistributedDataLoader does not support redistributing checkpoints to a different world size. "
-                f"Current process has world size {self.dp_world_size}, but checkpoint has {state_dict_world_size}."
+                f"Current process has world size {self.dp_world_size}, but checkpoint has size {state_dict_world_size}."
             )
 
         # Load the state

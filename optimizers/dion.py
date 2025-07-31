@@ -141,7 +141,7 @@ class Dion(Optimizer):
                 )
         if outer_shard_mesh is not None:
             if not isinstance(outer_shard_mesh, DeviceMesh):
-                raise ValueError(
+                raise TypeError(
                     f"Outer shard mesh must be a DeviceMesh, but got {type(outer_shard_mesh)}."
                 )
             if outer_shard_mesh.ndim != 1:
@@ -154,7 +154,7 @@ class Dion(Optimizer):
                 )
         if inner_shard_mesh is not None:
             if not isinstance(inner_shard_mesh, DeviceMesh):
-                raise ValueError(
+                raise TypeError(
                     f"Inner shard mesh must be a DeviceMesh, but got {type(inner_shard_mesh)}."
                 )
             if inner_shard_mesh.ndim != 1:
@@ -220,6 +220,9 @@ class Dion(Optimizer):
 
     @torch.no_grad()
     def step(self, closure=None):
+        """
+        Perform a single optimization step.
+        """
         loss = None
         if closure is not None:
             with torch.enable_grad():
@@ -384,9 +387,9 @@ class Dion(Optimizer):
         )
         using_process_group = isinstance(self._replicate_mesh, ProcessGroup)
         if using_device_mesh and not isinstance(x, DTensor):
-            raise ValueError("When using DeviceMesh, all parameters must be DTensor.")
+            raise TypeError("When using DeviceMesh, all parameters must be DTensor.")
         if using_process_group and isinstance(x, DTensor):
-            raise ValueError(
+            raise TypeError(
                 "When using DTensor parameters, the data parallel group must be specified by a DeviceMesh instead of ProcessGroup."
             )
 
@@ -421,7 +424,7 @@ class Dion(Optimizer):
 
                 # Check for double sharding on same tensor dimension
                 if dim_map[tensor_dim] is not None:
-                    raise ValueError(
+                    raise RuntimeError(
                         f"Got double-sharded DTensor for tensor dimension {placement.dim}."
                     )
                 dim_map[tensor_dim] = mesh_dim
@@ -444,7 +447,7 @@ class Dion(Optimizer):
 
                 # Check for double sharding on same mesh dimension
                 if outer_sharded and inner_sharded:
-                    raise ValueError(
+                    raise RuntimeError(
                         "Cannot have outer and inner sharding over the same process group."
                     )
 
@@ -456,7 +459,7 @@ class Dion(Optimizer):
                     and not outer_sharded
                     and not inner_sharded
                 ):
-                    raise ValueError(
+                    raise RuntimeError(
                         f"Got DTensor sharded on unrecognized {mesh_dim=}, which does not match outer_shard_mesh or inner_shard_mesh."
                     )
 
@@ -514,7 +517,7 @@ class Dion(Optimizer):
         r = min(r, m, n)
         Q_shape = (m, r) if param_config.is_transposed else (n, r)
 
-        # Set all-reduce PQ based on if it saves communication cost
+        # Set compressed_all_reduce based on if it saves communication cost
         # Otherwise we will all-reduce the gradient matrix instead
         if rank_fraction < 1 and (m + n) * r < m * n:
             param_config.compressed_all_reduce = True
@@ -572,7 +575,7 @@ class Dion(Optimizer):
         elif isinstance(self._replicate_mesh, ProcessGroup):
             dist.broadcast(tensor, group=self._replicate_mesh, group_src=0)
         else:
-            raise ValueError(
+            raise TypeError(
                 "Data parallel mesh must be either a DeviceMesh or ProcessGroup."
             )
 

@@ -66,7 +66,7 @@ class Hyperparameters:
     rank_fraction: float = 0.125
 
     # Optimizer specific hyperparameters
-    qr_method: str = "qr"
+    qr_method: str = "rcqr"
     cqr_warmup: float = 0.05
     rcqr_oversample: float = 1.25
     efficient: bool = False
@@ -106,7 +106,7 @@ def parse_cli_args():
     parser.add_argument(
         "--checkpoint_freq",
         type=int,
-        default=0,
+        default=None,
         help="Checkpoint every N steps, 0 to disable",
     )
 
@@ -128,7 +128,7 @@ def parse_cli_args():
         "--inv_rank_fraction",
         type=int,
         default=None,
-        help="Sparsity level for the optimizer",
+        help="1/r rank fraction for Dion",
     )
     parser.add_argument(
         "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
@@ -187,7 +187,7 @@ def parse_cli_args():
     # ---------- debugging ----------
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
     parser.add_argument(
-        "--no_compile", action="store_true", help="Disable torch.compile"
+        "--no_compile", action="store_true", help="Disable torch.compile for model"
     )
     parser.add_argument(
         "--no_triton", action="store_true", help="Disable Triton kernels"
@@ -501,6 +501,7 @@ class CheckpointManager:
         """
         Save the checkpoint to the path "self.checkpoint_dir/name/".
         The distributed checkpoint is a directory with sharded files.
+        It must reside on a shared filesystem accessible by all processes.
         """
         assert self.checkpoint_dir, "Checkpoint directory must be specified"
         self.step = step
@@ -654,12 +655,8 @@ def main():
         data_parallel_size,
     )
 
-    print0(
-        f"Training DataLoader: {train_loader.ntok_total} tokens across {len(train_loader.files)} files"
-    )
-    print0(
-        f"Validation DataLoader: {val_loader.ntok_total} tokens across {len(val_loader.files)} files"
-    )
+    print0(f"Training DataLoader: {len(train_loader.files)} files")
+    print0(f"Validation DataLoader: {len(val_loader.files)} files")
     print0("=" * 80)
 
     # --- Model Initialization ---
@@ -785,14 +782,16 @@ def main():
         else:
             print0("No previous checkpoint found, training model from scratch")
     else:
+        # No checkpoint path provided
         print0("Training model from scratch")
 
     print0("=" * 80)
 
     # --- WandB initialization ---
-    if MASTER_PROCESS and not cli_args.no_wandb:
+    if not cli_args.no_wandb and not cli_args.debug:
         assert hp.wandb_project_name, "wandb project name is required"
-        if not cli_args.debug:
+        if MASTER_PROCESS:
+            # Check if we already have a wandb ID from the checkpoint
             wandb_id = checkpoint_manager.wandb_id
             resume = "must" if wandb_id else "never"
             wandb.login(
@@ -807,9 +806,9 @@ def main():
                 id=wandb_id,
                 resume=resume,
             )
+            # If we got a new ID, update the checkpoint manager
             checkpoint_manager.wandb_id = wandb.run.id
 
-    if not cli_args.no_wandb and not cli_args.debug:
         # Broadcast wandb_id to all processes
         # Do this to ensure consistency of distributed checkpoint
         obj_list = [checkpoint_manager.wandb_id]
