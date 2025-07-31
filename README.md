@@ -24,7 +24,7 @@ param_groups = [
          algorithm="lion", lr=base_lr, weight_decay=0),
     dict(params=lm_head_params,
          algorithm="lion",
-         lr=base_lr / math.sqrt(hp.model_dim),          # ↓ LR for softmax head
+         lr=base_lr / math.sqrt(hp.model_dim),          # scaled-down LR for LM-head
          weight_decay=0),
 ]
 ```
