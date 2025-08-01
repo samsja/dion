@@ -275,6 +275,11 @@ This feature is applicable across any replicated data-parallel axis for DDP and 
 * If `replicate_mesh_grad_sync` is True (default) and a `replicate_mesh` is provided, Dion will all-reduce the low-rank compressed states during the optimizer step.
 * If `replicate_mesh_grad_sync` is False, Dion will expect that all data-parallel gradients have already been synchronized prior to the optimizer step.
 
+
+Below, we show that Dion with `dp=2, fs=4, tp=1` achieves matching validation loss regardless of whether `replicate_mesh_grad_sync` is set to `True` or `False`.
+
+<img src="images/grad-sync.png" alt="Distributed-Muon" width="300">
+
 ### Usage with HSDP
 Typically, hybrid sharding with `fully_shard()` uses a 2D device mesh. To use with Dion's compressed gradient synchronization, pass only the sharded sub-mesh to `fully_shard()`.
 
