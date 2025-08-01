@@ -38,6 +38,7 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 
 This code is written for modern PyTorch (version 2.7 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard`and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not guaranteed.
 
+
 ## Quick Start
 
 Install dependences:
@@ -68,8 +69,6 @@ Dion is our approach for a more scalable and communication-efficient optimizer. 
 
 
 ## Optimizers
-
-TODO actually rename the files to match
 
 Our implementations of Dion (`dion.py`) and Muon (`muon.py`) support the following parallelization techniques:
 
@@ -187,11 +186,6 @@ optimizer = Dion(
 )
 ```
 
-
-Below, we show that Dion with various distributed configurations—such as `dp=2, fs=2, tp=2`, `dp=2, fs=4, tp=1`, and `dp=1, fs=8, tp=1`—achieves validation loss curves that closely match that of full DDP Dion (up to stochastic noise). The rank fraction used for this experiment is 0.125.
-
-<img src="images/dist-dion.png" alt="Distributed-Muon" width="300">
-
 ### Flattened Meshes
 
 When more advanced parallelism strategies are used (such as context parallel or expert parallel), it is common for multiple mesh dimensions to be "flattened" into a 1D sub-mesh for sharding. In this scenario, the flattened mesh needs to be given to Dion.
@@ -241,11 +235,6 @@ optimizer = Muon(
 )
 ```
 
-Below, we show that Muon with `dp=1`, `fs=8`, and `tp=1` matches the validation loss of full DDP Muon. For comparison, we also include a full-rank Dion run as a reference.
-
-<img src="images/dist-muon.png" alt="Distributed-Muon" width="300">
-
-
 ### Usage with ProcessGroup for DDP
 
 Training with DistributedDataParallel (DDP) is also supported. Pass in the DDP-wrapped model's `process_group` instead of a device mesh. This will allow the optimizer to efficiently distribute work across all GPUs.
@@ -276,12 +265,8 @@ This feature is applicable across any replicated data-parallel axis for DDP and 
 * If `replicate_mesh_grad_sync` is True (default) and a `replicate_mesh` is provided, Dion will all-reduce the low-rank compressed states during the optimizer step.
 * If `replicate_mesh_grad_sync` is False, Dion will expect that all data-parallel gradients have already been synchronized prior to the optimizer step.
 
-
-Below, we show that Dion with `dp=2, fs=4, tp=1` achieves matching validation loss regardless of whether `replicate_mesh_grad_sync` is set to `True` or `False`.
-
-<img src="images/grad-sync.png" alt="Distributed-Muon" width="300">
-
 ### Usage with HSDP
+
 Typically, hybrid sharding with `fully_shard()` uses a 2D device mesh. To use with Dion's compressed gradient synchronization, pass only the sharded sub-mesh to `fully_shard()`.
 
 In other words, we don't let `fully_shard()` see the replicated mesh dimension, so it will not all-reduce gradients across it. Instead, Dion receives the replicated dimension as its `replicate_mesh` argument, and it will synchronize low-rank matrices during the optimizer step.
@@ -396,14 +381,12 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_efficien
 
 After the training you should be able to reproduce the second plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
 
-
 ### Triton Kernels for Muon Newton-Schulz
 
 Muon's Newton-Schulz iteration involves multiplying a matrix by its own transpose. The result is symmetric, so we can accelerate this computation by only computing half of the output and mirroring the result across the diagonal. We implemented this technique with Triton kernels in `optimizers/newton_schulz_triton.py`.
 
 Triton kernels can be enabled in Muon with the option `use_triton=True`. Note that compiling and tuning the kernels may take several minutes when it is first run.
 
-TODO Maybe this should be disabled by default
 
 # Citation 
 
