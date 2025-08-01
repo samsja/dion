@@ -24,7 +24,7 @@ val_tokens: 10485760
 save_every: 0
 
 # — Weights & Biases logging —
-wandb_project_name: dion-exp
+wandb_project_name: dion-debug
 wandb_job_name: null
 no_wandb: false
 

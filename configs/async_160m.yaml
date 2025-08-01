@@ -15,7 +15,7 @@ warmup_ratio: 0.0
 warmdown_ratio: 0.2
 
 # — Optimizer & Hyperparameters —
-rank_fraction: 1.0
+rank_fraction: 0.125
 mu: 0.95
 weight_decay: 0.01
 oversample: 1.25
@@ -34,7 +34,7 @@ no_wandb: false
 dp_size: null      # data‐parallel size
 fs_size: null      # FSDP size
 tp_size: null      # tensor‐parallel size
-replicate_mesh_grad_sync: true
+replicate_mesh_grad_sync: false
 
 # — Miscellaneous flags —
 debug: false
