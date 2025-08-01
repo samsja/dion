@@ -164,6 +164,8 @@ optimizer = Muon(
     ...
 )
 ```
+ 
+[Wandb report for distributed-muon sanity check](https://microsoft-research.wandb.io/kwangjunahn/dion-debug/reports/Distributed-Muon-Check--VmlldzoxODAzMA).
 
 ### Usage with ProcessGroup for DDP
 
