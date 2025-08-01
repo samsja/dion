@@ -5,6 +5,31 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 * See our paper for more information on Dion: https://arxiv.org/pdf/2504.05295.
 * See the original blog post on Muon: https://kellerjordan.github.io/posts/muon/
 
+<details>
+<summary>Table of Contents</summary>
+
+1. [Requirements](#-requirements)
+2. [Quick Start](#-quick-start)
+3. [Building Parameter Groups](#building-parameter-groups)
+   * [Example code](#example-code)
+4. [Distributed Training Configuration](#distributed-training-configuration)
+   * [Flattened Meshes](#flattened-meshes)
+   * [Device Mesh for Muon](#device-mesh-for-muon)
+   * [Usage with ProcessGroup for DDP](#usage-with-processgroup-for-ddp)
+5. [Compressed Data-Parallel Gradient Sync](#compressed-data-parallel-gradient-sync)
+   * [Usage with HSDP](#usage-with-hsdp)
+   * [Example code](#example-code-1)
+   * [Usage with DDP](#usage-with-ddp)
+6. [Comparison Between Optimizers](#comparison-between-optimizers)
+7. [Experimental Features](#-experimental-features)
+   * [Mixed Precision Dion](#mixed-precision-dion)
+   * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
+   * [Triton Kernels for Muon Newton-Schulz](#triton-kernels-for-muon-newton-schulz)
+8. [Citation](#citation)
+
+</details>
+
+
 ## 🔧 Requirements
 
 This code is written for modern PyTorch (version 2.7 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard`and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not guaranteed.
