@@ -713,13 +713,14 @@ def orthogonalize(
     assert not isinstance(P, DTensor), "Use distributed_orthogonalize() instead"
 
     m, n = P.shape
-    P_dtype = P.dtype
+    original_dtype = P.dtype
 
     # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
     if qr_method == "cqr":
-        R, info = torch.linalg.cholesky_ex(P.T @ P, upper=True)
+        P_32 = P.to(dtype=torch.float32)  # multiply in float32 for numerical stability
+        R, info = torch.linalg.cholesky_ex(P_32.T @ P_32, upper=True)
         if info == 0:
-            Q = torch.linalg.solve_triangular(R, P, upper=True, left=False)
+            Q = torch.linalg.solve_triangular(R, P_32, upper=True, left=False)
         else:
             qr_method = "rcqr"  # Fallback to randomized QR
 
@@ -752,7 +753,7 @@ def orthogonalize(
         R, _ = torch.linalg.cholesky_ex(QQ, upper=True)
         Q = torch.linalg.solve_triangular(R, Q, upper=True, left=False)
 
-    return Q.to(dtype=P_dtype)
+    return Q.to(dtype=original_dtype)
 
 
 def distributed_orthogonalize(
@@ -780,26 +781,25 @@ def distributed_orthogonalize(
 
     # Get desired placements for output
     m, r = P.shape
-    P_dtype = P.dtype
+    original_dtype = P.dtype
     placements = [Replicate() for _ in range(P.device_mesh.ndim)]
     if shard_mesh_dim is not None:
         placements[shard_mesh_dim] = Shard(0)  # Shard(0) = rows
 
     # Cholesky QR (may not be numerically stable) unless matrices are well-conditioned
     if qr_method == "cqr":
-        PP: DTensor = P.T @ P
-        PP_full = PP.full_tensor().to(dtype=torch.float32)
+        P_32 = P.to(dtype=torch.float32)  # multiply in float32 for numerical stability
+        PP: DTensor = P_32.T @ P_32
+        PP_full = PP.full_tensor()
         R_full, info = torch.linalg.cholesky_ex(PP_full, upper=True)
 
         if info == 0:
-            P_local = (
-                P.redistribute(placements=placements).to_local().to(dtype=torch.float32)
-            )
+            P_local = P_32.redistribute(placements=placements).to_local()
             Q_local = torch.linalg.solve_triangular(
                 R_full, P_local, upper=True, left=False
             )
             Q = DTensor.from_local(
-                Q_local.to(dtype=P_dtype),  # cast back to original dtype
+                Q_local.to(dtype=original_dtype),  # cast back to original dtype
                 device_mesh=P.device_mesh,
                 placements=placements,
             )
@@ -812,7 +812,7 @@ def distributed_orthogonalize(
         P_full = P.full_tensor().to(dtype=torch.float32)
         Q_full, _ = torch.linalg.qr(P_full)
         Q = DTensor.from_local(
-            Q_full.to(dtype=P_dtype),
+            Q_full.to(dtype=original_dtype),  # cast back to original dtype
             device_mesh=P.device_mesh,
         ).redistribute(placements=placements)
 
@@ -843,11 +843,12 @@ def distributed_orthogonalize(
         R_full, _ = torch.linalg.cholesky_ex(QQ_full, upper=True)
         Q_local = torch.linalg.solve_triangular(R_full, Q_local, upper=True, left=False)
         Q = DTensor.from_local(
-            Q_local.to(dtype=P_dtype),  # cast back to original dtype
+            Q_local.to(dtype=original_dtype),  # cast back to original dtype
             device_mesh=P.device_mesh,
             placements=placements,
         )
 
+    assert Q.dtype == original_dtype
     return Q
 
 
