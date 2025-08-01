@@ -61,10 +61,10 @@ class Muon(Optimizer):
         betas: Tuple[float, float] = (0.9, 0.95),
         weight_decay: float = 0.01,
         epsilon: float = 1e-8,
-        nesterov: bool = True,
+        nesterov: bool = False,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_triton: bool = True,
+        use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
     ):
         # Check hyperparameters
