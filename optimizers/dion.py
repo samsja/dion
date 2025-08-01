@@ -632,8 +632,11 @@ def dion_update(
         M.add_(R @ P.T, alpha=-(1 - mu))
 
     # Column normalize R to get new Q
+    # Do this in float32 for numerical stability
     # For sharded matrices, DTensor will automatically sync the full-tensor norm
-    Q = R / (R.norm(dim=0, keepdim=True) + epsilon)
+    R = R.to(dtype=torch.float32)
+    R_norm = R.norm(dim=0, keepdim=True) + epsilon
+    Q = (R / R_norm).to(P.dtype)
 
     # Apply weight decay
     X.mul_(1 - lr * weight_decay)

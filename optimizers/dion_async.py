@@ -813,7 +813,7 @@ def dion_update_ddp(
     )
 
     # Column normalize R to get new Q
-    Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
+    Q_batch = column_normalize(R_batch, epsilon=epsilon)
 
     # Compute update scale factor
     fan_out = X[0].size(0)
@@ -933,23 +933,24 @@ def dion_update_fsdp(
         assert isinstance(R_batch, DTensor)
         assert R_batch.placements[param_config.outer_shard_mesh_dim].is_shard()
 
-        # Compute per-shard squared norm and sum across shards
-        R_local = R_batch.to_local()
-        R_norm_sq = R_local.square().sum(dim=-2, keepdim=True)
-        R_norm_sq = funcol.all_reduce(
-            R_norm_sq,
+        # Compute per-shard squared sum and sum across shards
+        R_sum_sq = local_column_sum_sq(R_batch)
+        R_sum_sq = funcol.all_reduce(
+            R_sum_sq,
             reduceOp="sum",
             group=(R_batch.device_mesh, param_config.outer_shard_mesh_dim),
         )
         yield
 
-        # Normalize R and convert back to DTensor
-        Q_batch = dtensor_from_local(
-            R_local / (R_norm_sq.sqrt() + epsilon), ref=R_batch
+        Q_batch = column_normalize(
+            R_batch,
+            full_column_sum_sq=R_sum_sq,
+            epsilon=epsilon,
         )
 
     else:
-        Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
+        # The sum dimension is not sharded, so we can normalize directly
+        Q_batch = column_normalize(R_batch, epsilon=epsilon)
 
     # Compute update scale factor
     fan_out = X[0].size(0)
@@ -1082,23 +1083,24 @@ def dion_update_fsdp_tp(
         assert isinstance(R_batch, DTensor)
         assert R_batch.placements[param_config.outer_shard_mesh_dim].is_shard()
 
-        # Compute per-shard squared norm and sum across shards
-        R_local = R_batch.to_local()
-        R_norm_sq = R_local.square().sum(dim=-2, keepdim=True)
-        R_norm_sq = funcol.all_reduce(
-            R_norm_sq,
+        # Compute per-shard squared sum and sum across shards
+        R_sum_sq = local_column_sum_sq(R_batch)
+        R_sum_sq = funcol.all_reduce(
+            R_sum_sq,
             reduceOp="sum",
             group=(R_batch.device_mesh, param_config.outer_shard_mesh_dim),
         )
         yield
 
-        # Normalize R and convert back to DTensor
-        Q_batch = dtensor_from_local(
-            R_local / (R_norm_sq.sqrt() + epsilon), ref=R_batch
+        Q_batch = column_normalize(
+            R_batch,
+            full_column_sum_sq=R_sum_sq,
+            epsilon=epsilon,
         )
 
     else:
-        Q_batch = R_batch / (R_batch.norm(dim=-2, keepdim=True) + epsilon)
+        # The sum dimension is not sharded, so we can normalize directly
+        Q_batch = column_normalize(R_batch, epsilon=epsilon)
 
     # Compute update scale factor
     fan_out = X[0].size(0)
@@ -1161,6 +1163,7 @@ def tensor_list_to_batch(
 ) -> Tuple[Tensor, Tensor]:
     """
     Convert a list of tensors M and Q into 3D batched tensors.
+    Outputs M_batch and Q_batch will have dtype matching M.
     """
     # Transpose the momentum matrices if needed
     if is_transposed:
@@ -1398,6 +1401,53 @@ def fix_all_zero_or_nan(
     P = dtensor_from_local(P_local, ref=P)
     R = dtensor_from_local(R_local, ref=R)
     return P, R
+
+
+@torch.compile(fullgraph=True)
+def local_column_sum_sq(X: Tensor) -> Tensor:
+    """
+    Compute the per-column sum of squares of a tensor, or local shard of a DTensor.
+    If the input has shape (m, n), the output will have shape (1, n).
+    Regardless of input, the output will be a local tensor with float32 dtype.
+    """
+    X = to_local(X).to(dtype=torch.float32)
+    # Sum over all rows to get one value per column
+    X = X.square().sum(dim=-2, keepdim=True)
+    return X
+
+
+@torch.compile(fullgraph=True)
+def column_normalize(
+    X: Tensor,
+    full_column_sum_sq: Optional[Tensor] = None,
+    epsilon: float = 1e-8,
+) -> Tensor:
+    """
+    Normalize the columns of a tensor or local shard of a DTensor.
+    If the input is a row-sharded DTensor, full_column_sum_sq must be provided.
+    The computation is performed internally in float32 for numerical stability.
+    """
+    if isinstance(X, DTensor) and full_column_sum_sq is None:
+        # To compute the per-column norm, we need to sum across all rows
+        # If X is row sharded, we require full_column_sum_sq to be provided
+        if any(p.is_shard(X.ndim - 2) for p in X.placements):
+            raise RuntimeError("Cannot normalize row-sharded DTensor.")
+
+    original_dtype = X.dtype
+    X_local = to_local(X).to(dtype=torch.float32)
+
+    # Compute per-column sum of squares if not provided
+    if full_column_sum_sq is None:
+        full_column_sum_sq = X_local.square().sum(dim=-2, keepdim=True)
+    else:
+        full_column_sum_sq = to_local(full_column_sum_sq).to(dtype=torch.float32)
+
+    # Normalize each column
+    full_column_norm = torch.sqrt(full_column_sum_sq)
+    X_local = X_local / (full_column_norm + epsilon)
+
+    X = dtensor_from_local(X_local.to(original_dtype), ref=X)
+    return X
 
 
 @torch.compile(fullgraph=True)
