@@ -186,6 +186,11 @@ optimizer = Dion(
 )
 ```
 
+
+Below, we show that Dion with various distributed configurations—such as `dp=2, fs=2, tp=2`, `dp=2, fs=4, tp=1`, and `dp=1, fs=8, tp=1`—achieves validation loss curves that closely match that of full DDP Dion (up to stochastic noise). The rank fraction used for this experiment is 0.125.
+
+<img src="images/dist-dion.png" alt="Distributed-Muon" width="300">
+
 ### Flattened Meshes
 
 When more advanced parallelism strategies are used (such as context parallel or expert parallel), it is common for multiple mesh dimensions to be "flattened" into a 1D sub-mesh for sharding. In this scenario, the flattened mesh needs to be given to Dion.
