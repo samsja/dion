@@ -12,6 +12,7 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 1. [Requirements](#-requirements)
 1. [Quick Start](#-quick-start)
 1. [Introduction](#introduction)
+1. [Optimizers](#optimizers)
 1. [Building Parameter Groups](#building-parameter-groups)
    * [Example Code](#example-code)
 1. [Distributed Training Configuration](#distributed-training-configuration)
@@ -23,7 +24,6 @@ This repository provides efficient implementations of Dion and Muon optimizers f
    * [Example Code](#example-code-1)
    * [Usage with DDP](#usage-with-ddp)
    * [Checkpointing](#checkpointing)
-1. [Comparison Between Optimizers](#comparison-between-optimizers)
 1. [Experimental Features](#experimental-features)
    * [Mixed Precision Dion](#mixed-precision-dion)
    * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
@@ -63,9 +63,14 @@ Optimization algorithms are essential to training neural networks, converting gr
 
 The technique of orthonormal weight updates was first pioneered by [Muon](https://kellerjordan.github.io/posts/muon/), achieved success on the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has recently been demonstrated at scale by [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon performs orthonormalization using Newton-Schulz iteration, involving repeated matrix-matrix multiplication. However, large-scale training uses model sharding, where weight matrices and optimizer states are split across a network of distributed processes. Orthonormalizing a matrix in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
-Dion is our approach for a more scalable and communication-efficient optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses a different orthonormalization technique based on power iteration, which can be applied directly on sharded matrices. Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
+Dion is our approach for a more scalable and communication-efficient optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses an alternative orthonormalization method based on power iteration, which can be applied directly on sharded matrices. Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
 
-Our implementations of Dion and Muon support the following parallelization techniques:
+
+## Optimizers
+
+TODO actually rename the files to match
+
+Our implementations of Dion (`dion.py`) and Muon (`muon.py`) support the following parallelization techniques:
 
 | Parallelization    | Dion | Muon |
 |--------------------|------|------|
@@ -74,10 +79,18 @@ Our implementations of Dion and Muon support the following parallelization techn
 | PyTorch FSDP2      | Yes  | Yes  |
 | PyTorch FSDP2 + TP | Yes  | No   |
 
+For faster performance, both of these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
+
+In addition, we provide the following alternative implementations:
+ 
+* `dion_reference.py`: An implementation without batching or communication overlapping, intended to closely follow the algorithms as described in our [Dion paper](https://arxiv.org/pdf/2504.05295).
+* `dion_simple.py`: A simplified illustration of the Dion update rule in a single Python function, provided for educational value.
+* `muon_reference.py`: A version of Muon by [Moonshot AI](https://github.com/MoonshotAI/Moonlight), modified to take similar arguments as `muon.py`.
+
 
 ## Building Parameter Groups
 
-Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups. These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Other parameters are optimized using a different algorithm (Lion and AdamW are currently implemented) and may also use a different learning rate.
+Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups. These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Non-matrix parameters require a different scalar optimizer algorithm (element-wise updates) and may also use a different learning rate. We currently support Lion and AdamW.
 
 The details of parameter grouping are dependent on model architecture and implementation. Therefore, we leave it up to you to categorize your model's parameters and create the necessary parameter groups.
 
@@ -144,6 +157,7 @@ param_groups = [
     dict(params=lm_head_params, algorithm="lion", lr=lr / math.sqrt(model_dim), weight_decay=0)
 ]
 ```
+
 
 ## Distributed Training Configuration
 
@@ -246,6 +260,7 @@ optimizer = Muon(
 )
 ```
 
+
 ## Compressed Data-Parallel Gradient Sync
 
 Dion is capable of *skipping the usual full-gradient all-reduce* by only synchronizing low-rank *P* and *Q* factors (the PowerSGD trick---see [Vogels et al., 2019](https://arxiv.org/abs/1905.13727)). Depending on the rank fraction used, we can greatly compress the amount of communication needed while producing the exact same end result (up to numerical precision).
@@ -328,31 +343,13 @@ for data in dataloader:
 TODO
 
 
-## Comparison Between Optimizers
-
-TODO rename files
-
-* `dion_async.py`
-* `dion.py`
-* `dion_reference.py`
-* `dion_simple.py`
-* `muon.py`
-* `muon_reference.py`
-
-`dion_async.py` improves communication efficiency by:
-
-- **Processing parameter groups in batches**, amortizing overhead across multiple tensors.
-- **Splitting communication into `reduce-scatter` + `all-gather`** to better distribute the QR workload.
-- **Overlapping communication with compute** by interleaving batches asynchronously, reducing idle time on slower networks.
-
-
 ## Best Practices
 
-* Lion instead of AdamW for scalar parameters
-* Learning rate scaling - spectral norm, rms norm
-* Choosing the rank fraction
-* Choosing other hyperparameters
-* FSDP and TP sharding different dimensions
+* **Dion rank fraction:** The most important Dion-specific hyperparameter is the *rank fraction*, which controls the amount of low-rank compression. Setting `rank_fraction=1.0` resulting in full-rank updates without any compression, similar to Muon. Empirically, it appears that larger models are more tolerant of low-rank compression. At 3B parameters, `rank_fraction=0.25` (1/4 rank) achieves nearly equivalent performance as full-rank, and we expect that 1/8, 1/16, and perhaps lower rank fractions will work well at 10B+ scale.
+* **Lion vs. AdamW:** We have found that Lion performs better than AdamW for optimizing scalar parameters when used with Dion/Muon for orthonormal matrix updates.
+* **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension must be manually selected when applied on top of TP. See `models/gpt_model.py` for an example of explicitly specifying the shard dimension for `fully_shard()`. Double-sharded matrices along the same dimension will raise an error in Dion.
+* **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
+* **Other hyperparameters:** TODO
 
 
 ## Experimental Features
