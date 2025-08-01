@@ -29,11 +29,15 @@ wandb_project_name: dion-exp
 wandb_job_name: null
 no_wandb: false
 
+# — Distributed training —
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+tp_size: null      # tensor‐parallel size
+
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
-
 
 optimizer: muon 
 scalar_opt: lion

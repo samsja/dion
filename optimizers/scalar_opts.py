@@ -107,15 +107,17 @@ def adamw_update_foreach(
     assert batch_size == len(M)
     assert batch_size == len(V)
 
-    dtype = M[0].dtype
-    G = [g.to(dtype=dtype) for g in G]
+    M_dtype = M[0].dtype
+    V_dtype = V[0].dtype
 
     # Update momentum and variance
     # M = beta1 * M + (1 - beta1) * G
+    G = [g.to(dtype=M_dtype) for g in G]
     torch._foreach_lerp_(M, G, [1 - beta1] * batch_size)
 
     # V = beta2 * V + (1 - beta2) * G * G
     G_square = torch._foreach_mul(G, G)
+    G_square = [g.to(dtype=V_dtype) for g in G_square]
     torch._foreach_lerp_(V, G_square, [1 - beta2] * batch_size)
 
     # Bias correction

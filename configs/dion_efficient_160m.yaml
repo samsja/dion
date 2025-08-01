@@ -33,18 +33,17 @@ wandb_job_name: null
 no_wandb: false
 
 # — Distributed training —
-dp_size: null      # data‐parallel mesh dimension (set to an int to enable)
-fs_size: null      # FSDP mesh dimension
-tp_size: null      # tensor‐parallel mesh dimension
-opt_grad_sync: false
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+tp_size: null      # tensor‐parallel size
+replicate_mesh_grad_sync: true
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 
-
-optimizer: dion_reference
-efficient: true
+optimizer: dion
 scalar_opt: lion
 lr: 0.02
-approx_method: qr
+approx_method: cqr
+mixed_precision: true

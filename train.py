@@ -23,7 +23,7 @@ from typing import Optional
 
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
-from optimizers.dion import Dion
+from optimizers.dion import Dion, DionMixedPrecisionConfig
 from optimizers.dion_async import Dion as DionAsync
 from optimizers.dion_reference import Dion as DionReference
 from optimizers.dion_simple import Dion as DionSimple
@@ -71,6 +71,8 @@ class Hyperparameters:
     cqr_warmup: float = 0.05
     rcqr_oversample: float = 1.25
     efficient: bool = False
+    replicate_mesh_grad_sync: bool = False
+    mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
 
 
@@ -134,6 +136,9 @@ def parse_cli_args():
     parser.add_argument(
         "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
     )
+    parser.add_argument(
+        "--mixed_precision", action="store_true", help="Use mixed precision for Dion"
+    )
 
     # ---------- model ----------
     parser.add_argument("--model_dim", type=int, default=None)
@@ -175,7 +180,7 @@ def parse_cli_args():
         "--tp_size", type=int, default=None, help="Tensor Parallel size"
     )
     parser.add_argument(
-        "--opt_grad_sync",
+        "--replicate_mesh_grad_sync",
         action="store_true",
         help="Do data-parallel gradient sync inside Dion optimizer",
     )
@@ -205,6 +210,19 @@ def parse_cli_args():
         for k, v in yaml_cfg.items():
             if getattr(cli_args, k, None) is None:
                 setattr(cli_args, k, v)
+
+        # We need to manually handle store_true flags
+        for flag in (
+            "mixed_precision",
+            "replicate_mesh_grad_sync",
+            "fast_fsdp",
+            "no_wandb",
+            "no_compile",
+            "no_triton",
+            "debug",
+        ):
+            if yaml_cfg.get(flag, False):
+                setattr(cli_args, flag, True)
 
     return cli_args
 
@@ -332,16 +350,26 @@ def init_optimizer(
         outer_shard_mesh = None
         inner_shard_mesh = None
 
+    if hp.mixed_precision:
+        dion_mixed_precision_config = DionMixedPrecisionConfig(
+            momentum_dtype=torch.bfloat16,
+            variance_dtype=torch.bfloat16,
+            Q_dtype=torch.bfloat16,
+        )
+    else:
+        dion_mixed_precision_config = None
+
     if hp.optimizer == "dion":
         print0(f"Dion rank fraction: {hp.rank_fraction}")
         print0(f"Dion QR method: {hp.qr_method}")
-        print0(f"Compressed data-parallel gradient sync: {cli_args.opt_grad_sync}")
+        print0(f"Dion mixed precision: {hp.mixed_precision}")
+        print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
         opt = Dion(
             param_groups,
             replicate_mesh=replicate_mesh,
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
-            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
+            replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
             rank_fraction=hp.rank_fraction,
             lr=hp.lr,
             mu=hp.mu,
@@ -349,17 +377,19 @@ def init_optimizer(
             qr_method=hp.qr_method,
             cqr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
             rcqr_oversample=hp.rcqr_oversample,
+            mixed_precision_config=dion_mixed_precision_config,
         )
 
     elif hp.optimizer == "dion_async":
         print0(f"Dion rank fraction: {hp.rank_fraction}")
-        print0(f"Compressed data-parallel gradient sync: {cli_args.opt_grad_sync}")
+        print0(f"Dion mixed precision: {hp.mixed_precision}")
+        print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
         opt = DionAsync(
             param_groups,
             replicate_mesh=replicate_mesh,
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
-            replicate_mesh_grad_sync=cli_args.opt_grad_sync,
+            replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
             rank_fraction=hp.rank_fraction,
             lr=hp.lr,
             mu=hp.mu,
@@ -367,6 +397,7 @@ def init_optimizer(
             qr_method=hp.qr_method,
             cqr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
             rcqr_oversample=hp.rcqr_oversample,
+            mixed_precision_config=dion_mixed_precision_config,
         )
 
     elif hp.optimizer == "muon":
@@ -454,13 +485,13 @@ def init_optimizer(
     else:
         raise ValueError(f"Unsupported optimizer: {hp.optimizer}")
 
-    # Check opt_grad_sync and optimizer combination
-    if cli_args.opt_grad_sync and hp.optimizer not in ("dion", "dion_async"):
-        # Results will be wrong if opt_grad_sync is set for non-Dion optimizer
-        raise ValueError("--opt_grad_sync is set for non-Dion optimizer")
-    if not cli_args.opt_grad_sync and hp.optimizer in ("dion", "dion_async"):
-        # Using Dion without opt_grad_sync means we won't get communication savings
-        print0("Warning: not using --opt_grad_sync for Dion optimizer")
+    # Check replicate_mesh_grad_sync and optimizer combination
+    if hp.replicate_mesh_grad_sync and hp.optimizer not in ("dion", "dion_async"):
+        # Results will be wrong if replicate_mesh_grad_sync is set for non-Dion optimizer
+        raise ValueError("replicate_mesh_grad_sync is set for non-Dion optimizer")
+    if not hp.replicate_mesh_grad_sync and hp.optimizer in ("dion", "dion_async"):
+        # Using Dion without replicate_mesh_grad_sync means we won't get communication savings
+        print0("Warning: not using replicate_mesh_grad_sync for Dion optimizer")
 
     return opt
 
@@ -678,13 +709,13 @@ def main():
         model = GPT(gpt_config)
 
     # Shard the model if using a device mesh
-    # If opt_grad_sync is True, FSDP will not handle data-parallel gradient sync
-    # If opt_grad_sync if False, we use Pytorch HSDP to do data-parallel gradient sync
+    # If replicate_mesh_grad_sync is True, FSDP will not handle data-parallel gradient sync
+    # If replicate_mesh_grad_sync is False, we use Pytorch HSDP to do data-parallel gradient sync
     if device_mesh is not None:
         parallelize_gpt_model(
             model,
             device_mesh=device_mesh,
-            dp_name=(None if cli_args.opt_grad_sync else "dp"),
+            dp_name=(None if hp.replicate_mesh_grad_sync else "dp"),
             fs_name="fs",
             tp_name="tp",
             fsdp_reshard_after_forward=(not cli_args.fast_fsdp),
@@ -888,8 +919,8 @@ def main():
             loss = loss / grad_accum_steps
             x, y = train_loader.next_batch()
 
-            # Turn off DDP grad sync if opt_grad_sync is True
-            ddp_no_sync = i < grad_accum_steps or cli_args.opt_grad_sync
+            # Turn off DDP grad sync if replicate_mesh_grad_sync is True
+            ddp_no_sync = i < grad_accum_steps or hp.replicate_mesh_grad_sync
             if isinstance(model, DDP) and ddp_no_sync:
                 with model.no_sync():
                     loss.backward()
