@@ -24,6 +24,7 @@ This repository provides efficient implementations of Dion and Muon optimizers f
    * [Example Code](#example-code-1)
    * [Usage with DDP](#usage-with-ddp)
    * [Checkpointing](#checkpointing)
+1. [Best Practices](#best-practices)
 1. [Experimental Features](#experimental-features)
    * [Mixed Precision Dion](#mixed-precision-dion)
    * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
@@ -359,6 +360,7 @@ TODO
 * **Lion vs. AdamW:** We have found that Lion performs better than AdamW for optimizing scalar parameters when used with Dion/Muon for orthonormal matrix updates.
 * **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension must be manually selected when applied on top of TP. See `models/gpt_model.py` for an example of explicitly specifying the shard dimension for `fully_shard()`. Double-sharded matrices along the same dimension will raise an error in Dion.
 * **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
+* **Nesterov momentum:** In Muon, we set Nesterov momentum to `False` by default, as we observed better performance without it. Dion does not implement Nesterov momentum.
 * **Other hyperparameters:** TODO
 
 

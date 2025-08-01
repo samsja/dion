@@ -18,7 +18,7 @@ warmdown_ratio: 0.2
 rank_fraction: 0.5 
 mu: 0.95
 weight_decay: 0.01
-qr_warmup: 0.05 # QR warmup for faster training. Used when efficiency = true.
+qr_warmup: 0.05
 oversample: 1.25
 
 # — Validation & Checkpointing —
@@ -27,7 +27,7 @@ val_tokens: 10485760
 save_every: 0
 
 # — Weights & Biases logging —
-wandb_project_name: dion-exp
+wandb_project_name: dion-debug
 wandb_job_name: null
 no_wandb: false
 
@@ -41,7 +41,7 @@ replicate_mesh_grad_sync: true
 debug: false
 no_compile: false
 
-optimizer: dion
+optimizer: dion_reference
 scalar_opt: lion
 lr: 0.02
 approx_method: cqr

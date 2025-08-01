@@ -23,7 +23,6 @@ from typing import Optional
 from models.gpt_model import GPT, GPTConfig, parallelize_gpt_model
 from models.gpt_utils import DistributedDataLoader
 from optimizers.dion import Dion, DionMixedPrecisionConfig
-from optimizers.dion_async import Dion as DionAsync
 from optimizers.dion_reference import Dion as DionReference
 from optimizers.dion_simple import Dion as DionSimple
 from optimizers.muon import Muon
@@ -69,7 +68,6 @@ class Hyperparameters:
     qr_method: str = "rcqr"
     cqr_warmup: float = 0.05
     rcqr_oversample: float = 1.25
-    efficient: bool = False
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
@@ -360,7 +358,6 @@ def init_optimizer(
 
     if hp.optimizer == "dion":
         print0(f"Dion rank fraction: {hp.rank_fraction}")
-        print0(f"Dion QR method: {hp.qr_method}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
         opt = Dion(
@@ -379,11 +376,12 @@ def init_optimizer(
             mixed_precision_config=dion_mixed_precision_config,
         )
 
-    elif hp.optimizer == "dion_async":
+    elif hp.optimizer == "dion_reference":
         print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion QR method: {hp.qr_method}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
-        opt = DionAsync(
+        opt = DionReference(
             param_groups,
             replicate_mesh=replicate_mesh,
             outer_shard_mesh=outer_shard_mesh,
@@ -426,26 +424,6 @@ def init_optimizer(
             use_triton=(not cli_args.no_triton),
         )
 
-    elif hp.optimizer == "dion_reference":
-        assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
-        assert hp.qr_method is not None
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
-        if hp.efficient == True:
-            assert hp.rank_fraction <= 0.5, (
-                "For efficient Dion, rank_fraction must be <= 0.5 to use CQR trick. Speedup"
-                "for rank_fraction=1 is under development"
-            )
-        opt = DionReference(
-            param_groups,
-            lr=hp.lr,
-            mu=hp.mu,
-            weight_decay=hp.weight_decay,
-            rank=round(hp.rank_fraction * hp.model_dim),
-            qr_method=hp.qr_method,
-            qr_warmup_steps=round(hp.cqr_warmup * hp.num_iterations),
-            efficient=hp.efficient,
-        )
-
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
         print0(f"Dion rank fraction: {hp.rank_fraction}")
@@ -485,10 +463,10 @@ def init_optimizer(
         raise ValueError(f"Unsupported optimizer: {hp.optimizer}")
 
     # Check replicate_mesh_grad_sync and optimizer combination
-    if hp.replicate_mesh_grad_sync and hp.optimizer not in ("dion", "dion_async"):
+    if hp.replicate_mesh_grad_sync and hp.optimizer not in ("dion", "dion_reference"):
         # Results will be wrong if replicate_mesh_grad_sync is set for non-Dion optimizer
         raise ValueError("replicate_mesh_grad_sync is set for non-Dion optimizer")
-    if not hp.replicate_mesh_grad_sync and hp.optimizer in ("dion", "dion_async"):
+    if not hp.replicate_mesh_grad_sync and hp.optimizer in ("dion", "dion_reference"):
         # Using Dion without replicate_mesh_grad_sync means we won't get communication savings
         print0("Warning: not using replicate_mesh_grad_sync for Dion optimizer")
 
@@ -779,8 +757,6 @@ def main():
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
     if "dion" in hp.optimizer:
         run_name += f"_sp={hp.rank_fraction}"
-        if hp.efficient:
-            run_name += f"_eff=True"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
     if cli_args.wandb_job_name:
