@@ -9,24 +9,26 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 <details>
   <summary>Show/Hide</summary>
 
-1. [Requirements](#requirements)
-2. [Quick Start](#quick-start)
-3. [Building Parameter Groups](#building-parameter-groups)
-   * [Example code](#example-code)
-4. [Distributed Training Configuration](#distributed-training-configuration)
+1. [Requirements](#-requirements)
+1. [Quick Start](#-quick-start)
+1. [Introduction](#introduction)
+1. [Building Parameter Groups](#building-parameter-groups)
+   * [Example Code](#example-code)
+1. [Distributed Training Configuration](#distributed-training-configuration)
    * [Flattened Meshes](#flattened-meshes)
    * [Device Mesh for Muon](#device-mesh-for-muon)
    * [Usage with ProcessGroup for DDP](#usage-with-processgroup-for-ddp)
-5. [Compressed Data-Parallel Gradient Sync](#compressed-data-parallel-gradient-sync)
+1. [Compressed Data-Parallel Gradient Sync](#compressed-data-parallel-gradient-sync)
    * [Usage with HSDP](#usage-with-hsdp)
-   * [Example code](#example-code-1)
+   * [Example Code](#example-code-1)
    * [Usage with DDP](#usage-with-ddp)
-6. [Comparison Between Optimizers](#comparison-between-optimizers)
-7. [Experimental Features](#experimental-features)
+   * [Checkpointing](#checkpointing)
+1. [Comparison Between Optimizers](#comparison-between-optimizers)
+1. [Experimental Features](#experimental-features)
    * [Mixed Precision Dion](#mixed-precision-dion)
    * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
    * [Triton Kernels for Muon Newton-Schulz](#triton-kernels-for-muon-newton-schulz)
-8. [Citation](#citation)
+1. [Citation](#citation)
 
 </details>
 
@@ -47,7 +49,7 @@ Download pretokenized FineWeb dataset:
 python data/cached_fineweb10B.py 16
 ```
 
-Example with training a 160M model:
+Example for training a GPT-small model with Dion (replace 8 with the number of GPUs on your machine):
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml
 ``` 
@@ -55,16 +57,36 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yam
 After the training you should be able to reproduce the first plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
 
 
+## Introduction
+
+Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW, but recent works have shown the potential for *matrix orthonormalization* to accelerate model convergence.
+
+The technique of orthonormal weight updates was first pioneered by [Muon](https://kellerjordan.github.io/posts/muon/), achieved success on the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has recently been demonstrated at scale by [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon performs orthonormalization using Newton-Schulz iteration, involving repeated matrix-matrix multiplication. However, large-scale training uses model sharding, where weight matrices and optimizer states are split across a network of distributed processes. Orthonormalizing a matrix in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
+
+Dion is our approach for a more scalable and communication-efficient optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses a different orthonormalization technique based on power iteration, which can be applied directly on sharded matrices. Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
+
+Our implementations of Dion and Muon support the following parallelization techniques:
+
+| Parallelization    | Dion | Muon |
+|--------------------|------|------|
+| Single device      | Yes  | Yes  |
+| PyTorch DDP        | Yes  | Yes  |
+| PyTorch FSDP2      | Yes  | Yes  |
+| PyTorch FSDP2 + TP | Yes  | No   |
+
+
 ## Building Parameter Groups
 
-Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups. The Dion and Muon algorithms are only applicable to two-dimensional matrix weights. Other parameters are optimized using a different algorithm (Lion and AdamW are currently implemented) and may also use a different learning rate. The details of parameter grouping are dependent on model architecture and implementation. Therefore, we leave it up to you to categorize your model's parameters and create the necessary parameter groups.
+Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups. These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Other parameters are optimized using a different algorithm (Lion and AdamW are currently implemented) and may also use a different learning rate.
+
+The details of parameter grouping are dependent on model architecture and implementation. Therefore, we leave it up to you to categorize your model's parameters and create the necessary parameter groups.
 
 * In transformer models and many other neural networks, most parameters are `nn.Linear` layers with two-dimensional weight matrices. These parameters should use Dion or Muon. A shape-dependent learning rate scale factor will be automatically applied for each matrix.
 * Biases in `nn.Linear` layers (if used) are one-dimensional vectors, which must be placed into a separate parameter group from the weight matrices. Use Lion or AdamW.
-* Normalization layers (`nn.LayerNorm`, `nn.RMSNorm`) may contain a vector of learnable weights. Use Lion or AdamW.
-* Embedding layers (`nn.Embedding`) are stored as 2D tensors, should be treated as a collection of 1D vectors using Lion or AdamW. (Using Dion here will run without error, but will give poor performance.)
+* Normalization layers (e.g. `nn.LayerNorm`, `nn.RMSNorm`) may contain vectors of learnable weights. Use Lion or AdamW.
+* Embedding layers (e.g. `nn.Embedding`) are stored as 2D tensors, should be treated as a collection of 1D vectors using Lion or AdamW. (Using Dion here will run without error, but will give poor performance.)
 * Unembedding layers (e.g. LM head) are typically implemented as a `nn.Linear` layer, but shoud also be treated as a collection of 1D vectors. Furthermore, they should use a smaller *scaled learning rate*. It is very important to manually identify this layer and place it into its own parameter group, as it is otherwise indistinguishable from weight matrices!
-* Convolution layers typically use parameter tensors with 3+ dimensions. These are currently not supported for Dion. Support for convolution layers in Muon is experimental, and can be enabled by passing `flatten=True` to automatically flatten them to 2D matrices when computing the optimizer update.
+* Convolution layers typically use parameter tensors with 3+ dimensions. These are currently not supported for Dion. Support for convolution layers in Muon is experimental, and can be enabled with the option `flatten=True` to automatically flatten them to 2D matrices when computing the optimizer update.
 
 We summarize the above in this table. Let `d_in` be the input dimension of the unembedding layer. In transformer language models, this is the base dimension of the model.
 
@@ -76,9 +98,13 @@ We summarize the above in this table. Let `d_in` be the input dimension of the u
 | Embedding     | `nn.Embedding.weight`                       | `"lion"` / `"adamw"`  | `lr`                   |
 | Unembedding   | `nn.Linear.weight` (must identify manually) | `"lion"` / `"adamw"`  | `lr / math.sqrt(d_in)` |
 
-It is permissible to place biases, embeddings, and normalization parameters into a single parameter group if they use the same hyperparameters.
+We emphasize again that particular care needs to be taken with embedding and unembedding layers. They must be isolated from ordinary matrix parameters, and the unembedding layer futhermore should use a scaled learning rate. Merely checking the dimensions of a parameter (such as `if p.ndim == 2`) or the type of the module (such as `if isinstance(module, nn.Linear)`) **is not sufficient** to identify these special parameters. This is why we require manual parameter group creation.
 
-### Example code
+The optimizer cannot tell if a given parameter is a weight matrix, embedding, or unembedding, because they are all two-dimensional tensors. You will not receive any errors if these parameters are incorrectly grouped with matrix weights!
+
+It is permissible to place biases, embeddings, and normalization parameters into a single parameter group if they share the same hyperparameters. A good rule of thumb is that when training a transformer model, the optimizer should have at least 3 parameter groups---one for the weight matrices, one for the LM head, and one for everything else.
+
+### Example Code
 
 ```python
 class TransformerModel(nn.Module):
@@ -87,13 +113,15 @@ class TransformerModel(nn.Module):
     lm_head = nn.Linear(model_dim, vocab_dim)
 
 model = TransformerModel()
+
+# Note that the following will vary depending on your model architecture
 matrix_params = list(p for p in model.blocks.parameters() if p.ndim == 2)
 vector_params = list(p for p in model.blocks.parameters() if p.ndim != 2)
 embed_params  = list(model.embedding.parameters())
 lm_head_params= list(model.lm_head.parameters())
 
 param_groups = [
-    dict(params=matrix_params),  # defaults to "dion" algorithm
+    dict(params=matrix_params),  # will default to "dion" algorithm
     dict(params=vector_params, algorithm="lion"),
     dict(params=embed_params, algorithm="lion"),
     dict(params=lm_head_params, algorithm="lion", lr=lr / math.sqrt(model_dim))
@@ -119,7 +147,9 @@ param_groups = [
 
 ## Distributed Training Configuration
 
-In order for Dion to work, it must know about the parallelization scheme for training your model. This is done by passing in `DeviceMesh` objects when constructing the optimizer.
+In order for our efficient distributed optimizers to work, they must know about the parallelization scheme for training your model. This is done by passing in `DeviceMesh` objects when constructing the optimizer.
+
+### Device Mesh for Dion
 
 Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The `outer_shard_mesh` will be unsharded before entering Dion's orthogonalization sub-routine, while the `inner_shard_mesh` remains sharded throughout orthogonalization. The `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
 
@@ -135,9 +165,9 @@ mesh = init_device_mesh(
 
 optimizer = Dion(
     param_groups,
-    replicate_mesh = mesh["dp"],       # Replicated data parallel
-    outer_shard_mesh = mesh["fs"],     # Sharded data parallel
-    inner_shard_mesh = mesh["tp"],     # Tensor parallel
+    replicate_mesh = mesh["dp"],    # Replicated data parallel
+    outer_shard_mesh = mesh["fs"],  # Sharded data parallel
+    inner_shard_mesh = mesh["tp"],  # Tensor parallel
     ...
 )
 ```
@@ -159,16 +189,16 @@ fully_shard(model, mesh=fs_mesh)
 
 optimizer = Dion(
     param_groups,
-    replicate_mesh = None,             # Replicated data parallel
-    outer_shard_mesh = fs_mesh,        # Sharded data parallel
-    inner_shard_mesh = mesh["tp"],     # Tensor parallel
+    replicate_mesh = None,          # Replicated data parallel
+    outer_shard_mesh = fs_mesh,     # Sharded data parallel
+    inner_shard_mesh = mesh["tp"],  # Tensor parallel
     ...
 )
 ```
 
 ### Device Mesh for Muon
 
-Muon and Dion use different device mesh arguments.
+Muon uses different device mesh arguments from Dion.
 
 Our implementation of Muon takes a single 1D device mesh as a generic `distributed_mesh` argument. If this mesh is used for sharding parameters, Muon will efficiently perform unsharding using all-to-all. If this mesh is not used for sharding, Muon will distribue work across this mesh and all-gather the final results.
 
@@ -234,10 +264,10 @@ Note that if we choose to disable Dion's compressed gradient synchronization, we
 
 | Option                       | `fully_shard()` device mesh | `replicate_mesh_grad_sync` | Optimizer states | Model weights       |
 |------------------------------|-----------------------------|----------------------------|------------------|---------------------|
-| Dion syncs compressed states | 1D shard sub-mesh           | `True`                     | Decoupled        | Always synchronized |
-| FSDP syncs full gradients    | 2D hybrid-sharding mesh     | `False`                    | Synchronous      | Always synchronized |
+| Dion syncs compressed states | 1D shard sub-mesh           | `True`                     | Decoupled        | Always synchronous |
+| FSDP syncs full gradients    | 2D hybrid-shard mesh        | `False`                    | Synchronous      | Always synchronous |
 
-### Example code
+### Example Code
 
 ```python
 # ------------------------------------------------------------
@@ -245,7 +275,7 @@ Note that if we choose to disable Dion's compressed gradient synchronization, we
 # ------------------------------------------------------------
 mesh = init_device_mesh("cuda", (dp, fs), ("dp", "fs"))
 
-fully_shard(model, mesh=mesh["fs"])   # DP mesh not provided here
+fully_shard(model, mesh=mesh["fs"])  # DP mesh not provided here
 
 opt = Dion(
     param_groups,
@@ -293,6 +323,10 @@ for data in dataloader:
     model.zero_grad()
 ```
 
+### Checkpointing
+
+TODO
+
 
 ## Comparison Between Optimizers
 
@@ -312,18 +346,28 @@ TODO rename files
 - **Overlapping communication with compute** by interleaving batches asynchronously, reducing idle time on slower networks.
 
 
+## Best Practices
+
+* Lion instead of AdamW for scalar parameters
+* Learning rate scaling - spectral norm, rms norm
+* Choosing the rank fraction
+* Choosing other hyperparameters
+* FSDP and TP sharding different dimensions
+
+
 ## Experimental Features
 
 ### Mixed Precision Dion
 
-TODO
+By default, Dion will initialize its optimizer states to use the same data type as the model's parameters. The `DionMixedPrecisionConfig` class may be used to specify custom data types. In our preliminary experiments, we have found that using `torch.bfloat16` for Dion's optimizer states can reduce memory use and speed up computation with no impact to training stability.
 
 ```python
 from dion import Dion, DionMixedPrecisionConfig
 
 dion_mixed_precision_config = DionMixedPrecisionConfig(
     momentum_dtype=torch.bfloat16,
-    Q_dtype=torch.bfloat16,
+    Q_dtype=torch.bfloat16,  # for the low-rank Q matrix
+    variance_dtype=torch.float32,  # only used for AdamW
 )
 optimizer = Dion(
     ...
@@ -332,13 +376,11 @@ optimizer = Dion(
 )
 ```
 
-### Accelerating Optimization step for lower ranks
+### Faster Dion for lower ranks
 
-After a few warmup iterations, the expensive QR decomposition can be replaced with **CQR**, leading to **2X** optimization step speedups.
+After a few warmup iterations, the expensive QR decomposition can be replaced with the Cholesky QR (CQR) algorithm, leading to **2X** optimization step speedups. CQR is faster but less numerically stable. We have found that after some initial warmup period, the input matrix for orthogonalization becomes relatively well-conditioned. If Cholesky decomposition fails, we fall back to the standard QR decomposition procedure.
 
-> ⚠️ **Note:** Speedup for **rank fraction = 1.0** is still under development. For models **larger than 10B**, you may need to **further reduce the rank fraction** to see benefits.
-
-To train the accelerated 160M model:
+To try out the CQR accelerated configuration:
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_efficient_160m.yaml
 ```
@@ -348,9 +390,11 @@ After the training you should be able to reproduce the second plot in [validatio
 
 ### Triton Kernels for Muon Newton-Schulz
 
-TODO
+Muon's Newton-Schulz iteration involves multiplying a matrix by its own transpose. The result is symmetric, so we can accelerate this computation by only computing half of the output and mirroring the result across the diagonal. We implemented this technique with Triton kernels in `optimizers/newton_schulz_triton.py`.
 
-Maybe this should be disabled by default
+Triton kernels can be enabled in Muon with the option `use_triton=True`. Note that compiling and tuning the kernels may take several minutes when it is first run.
+
+TODO Maybe this should be disabled by default
 
 # Citation 
 
@@ -364,4 +408,3 @@ If you use Dion in your research, please cite:
   year={2025}
 }
 ``` 
----
