@@ -782,16 +782,13 @@ def main():
     # --- Logging initialization ---
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
-    opt_name = f"{hp.optimizer}+{hp.scalar_opt}"
-    run_name = f"({opt_name})"
+    run_name = f"({hp.optimizer}+{hp.scalar_opt})"
     if "dion" in hp.optimizer:
         run_name += f"_sp={hp.rank_fraction}"
         if hp.efficient:
             run_name += f"_eff=True"
     if cli_args.dp_size is not None:
-        run_name += (
-            f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.opt_grad_sync}"
-        )
+        run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
     if cli_args.wandb_job_name:
         run_name += f"_{cli_args.wandb_job_name}"
 
