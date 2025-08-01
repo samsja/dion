@@ -5,11 +5,12 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 * See our paper for more information on Dion: https://arxiv.org/pdf/2504.05295.
 * See the original blog post on Muon: https://kellerjordan.github.io/posts/muon/
 
+## Table of Contents
 <details>
-<summary>Table of Contents</summary>
+  <summary>Show/Hide</summary>
 
-1. [Requirements](#-requirements)
-2. [Quick Start](#-quick-start)
+1. [Requirements](#requirements)
+2. [Quick Start](#quick-start)
 3. [Building Parameter Groups](#building-parameter-groups)
    * [Example code](#example-code)
 4. [Distributed Training Configuration](#distributed-training-configuration)
@@ -21,7 +22,7 @@ This repository provides efficient implementations of Dion and Muon optimizers f
    * [Example code](#example-code-1)
    * [Usage with DDP](#usage-with-ddp)
 6. [Comparison Between Optimizers](#comparison-between-optimizers)
-7. [Experimental Features](#-experimental-features)
+7. [Experimental Features](#experimental-features)
    * [Mixed Precision Dion](#mixed-precision-dion)
    * [Accelerating Optimization Step for Lower Ranks](#accelerating-optimization-step-for-lower-ranks)
    * [Triton Kernels for Muon Newton-Schulz](#triton-kernels-for-muon-newton-schulz)
@@ -30,11 +31,11 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 </details>
 
 
-## 🔧 Requirements
+## Requirements
 
 This code is written for modern PyTorch (version 2.7 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard`and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not guaranteed.
 
-## ⚡ Quick Start
+## Quick Start
 
 Install dependences:
 ```bash
@@ -311,7 +312,7 @@ TODO rename files
 - **Overlapping communication with compute** by interleaving batches asynchronously, reducing idle time on slower networks.
 
 
-## 🚀 Experimental Features
+## Experimental Features
 
 ### Mixed Precision Dion
 
