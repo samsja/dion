@@ -166,6 +166,7 @@ optimizer = Muon(
 ```
 
 Below, we show that Muon with `dp=1`, `fs=8`, and `tp=1` matches the validation loss of full DDP Muon. For comparison, we also include a full-rank Dion run as a reference.
+
 <img src="images/dist-muon.png" alt="Distributed-Muon" width="300">
 
 
