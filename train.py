@@ -83,12 +83,6 @@ def print0(*args):
     if MASTER_PROCESS:
         print(*args)
 
-def int_or_none(x: str | None):
-    if x is None:
-        return None
-    if str(x).lower() in ("none", "null"):
-        return None
-    return int(x)
 
 def parse_cli_args():
     # --- Command-line argument parsing ---
@@ -176,13 +170,13 @@ def parse_cli_args():
 
     # ---------- distributed training ----------
     parser.add_argument(
-        "--dp_size", type=int_or_none, default=None, help="Data Parallel size (no sharding)"
+        "--dp_size", type=int, default=None, help="Data Parallel size (no sharding)"
     )
     parser.add_argument(
-        "--fs_size", type=int_or_none, default=None, help="Fully Sharded Data Parallel size"
+        "--fs_size", type=int, default=None, help="Fully Sharded Data Parallel size"
     )
     parser.add_argument(
-        "--tp_size", type=int_or_none, default=None, help="Tensor Parallel size"
+        "--tp_size", type=int, default=None, help="Tensor Parallel size"
     )
     parser.add_argument(
         "--replicate_mesh_grad_sync",
