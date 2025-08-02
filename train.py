@@ -938,8 +938,15 @@ def main():
         pbar.update(1)
         pbar.set_postfix(train_loss=f"{train_loss.item():.4f}")
 
-        # Save distributed checkpoint
         if hp.checkpoint_freq > 0 and step % hp.checkpoint_freq == 0 and step > 0:
+            # See if optimizer defines synchronize_for_checkpoint()
+            if hasattr(optimizer, "synchronize_for_checkpoint"):
+                # Dion with replicate_mesh_grad_sync will have decoupled optimizer states
+                # Calling this is necessary to synchronize state across the replicate mesh
+                # Otherwise, checkpoint results will not be consistent
+                optimizer.synchronize_for_checkpoint()
+
+            # Save a distributed checkpoint
             checkpoint_manager.save(step=step)
 
         torch.cuda.synchronize()

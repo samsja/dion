@@ -86,9 +86,9 @@ With the appropriate configuration, you should be able to reproduce the results 
 
 ## Introduction
 
-Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW. However, recent work has shown that incorporating a **matrix orthonormalization update rule** can significantly accelerate model convergence. See [[Bernstein-Newhouse 2025]](https://openreview.net/forum?id=hErdffTsLu&referrer=%5Bthe+profile+of+Jeremy+Bernstein%5D%28%2Fprofile%3Fid%3D%7EJeremy_Bernstein1%29) for theoertical justification.  
+Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW. However, recent work has shown that **orthonormalized matrix updates** can significantly accelerate model convergence. See [Bernstein and Newhouse, 2025](https://openreview.net/forum?id=hErdffTsLu) for a theoretical justification.
 
-The practical effectiveness of orthonormal updates was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via the *Newton-Schulz iteration*, which relies on repeated matrix–matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As extensively discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a matrix with Newton-Schulz iterations in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
+The practical effectiveness of orthonormal updates was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via *Newton-Schulz iterations*, which relies on repeated matrix-matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a sharded matrix with Newton-Schulz iterations involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
 **Dion** is our approach for a more **scalable and communication-efficient** optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses an alternative orthonormalization method based on amortized power iteration (in the style of [PowerSGD](https://arxiv.org/pdf/1905.13727)), which can be applied directly on sharded matrices. Furthermore, Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
 
@@ -124,9 +124,9 @@ The details of parameter grouping are dependent on model architecture and implem
 * In transformer models and many other neural networks, most parameters are `nn.Linear` layers with two-dimensional weight matrices. These parameters should use Dion or Muon. A shape-dependent learning rate scale factor will be automatically applied for each matrix.
 * Biases in `nn.Linear` layers (if used) are one-dimensional vectors, which must be placed into a separate parameter group from the weight matrices. Use Lion or AdamW.
 * Normalization layers (e.g. `nn.LayerNorm`, `nn.RMSNorm`) may contain vectors of learnable weights. Use Lion or AdamW.
-* Embedding layers (e.g. `nn.Embedding`) are stored as 2D tensors, but should be treated as a collection of 1D vectors using Lion or AdamW. (**Warning:** using Dion here will run without error, but will give poor performance.)
+* Embedding layers (e.g. `nn.Embedding`) are stored as 2D tensors, but should be treated as a collection of 1D vectors using Lion or AdamW. (Warning: using Dion here will run without error, but will give poor performance.)
 * Unembedding layers (e.g. LM head) are typically implemented as a `nn.Linear` layer, but shoud also be treated as a collection of 1D vectors. Furthermore, they should use a **smaller scaled learning rate**. It is very important to manually identify this layer and place it into its own parameter group, as it is otherwise indistinguishable from weight matrices!
-(**Warning:** using Dion here will run without error, but will give poor performance.)
+(Warning: using Dion here will run without error, but will give poor performance.)
 * Convolution layers typically use parameter tensors with 3+ dimensions. These are currently not supported for Dion. Support for convolution layers in Muon is experimental, and can be enabled with the option `flatten=True` to automatically flatten them to 2D matrices when computing the optimizer update.
 
 We summarize the above in this table. Let `d_in` be the input dimension of the unembedding layer. In transformer language models, this is the base dimension of the model.
@@ -193,7 +193,7 @@ In order for our efficient distributed optimizers to work, they must know about 
 
 ### Device Mesh for Dion
 
-Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The sharded meshes are referred to as `outer_shard_mesh` and `inner_shard_mesh`. Dion's internal optimizer states can be sharded over both meshes. During the update computation, the low-rank matrix orthonormalized by Dion is replicated across `outer_shard_mesh` but remains sharded across `inner_shard_mesh`. Thus, the `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
+Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The sharded meshes are referred to as `outer_shard_mesh` and `inner_shard_mesh`. Dion's internal optimizer states can be sharded over both meshes. During the update computation, Dion will orthonormalize a low-rank matrix that is replicated across `outer_shard_mesh`, but always remains sharded across `inner_shard_mesh`. Thus, the `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
 
 Unused meshes may be omitted or given as `None`. If only one sharding dimension is used (e.g. only FSDP without TP), we recommend providing it as the `outer_shard_mesh`. Dion will execute a faster single-device orthonormalization routine in this case, since the input matrix to be orthonormalized will not be sharded.
 
@@ -286,7 +286,7 @@ optimizer = Muon(
 
 ## Compressed Data-Parallel Gradient Sync
 
-Dion is capable of *skipping the usual full-gradient all-reduce* by only synchronizing low-rank *P* and *Q* factors (the PowerSGD trick---see [Vogels et al., 2019](https://arxiv.org/abs/1905.13727)). Depending on the rank fraction used, we can greatly compress the amount of communication needed while producing the exact same end result (up to numerical precision).
+Dion is capable of *skipping the usual full-gradient all-reduce* by only synchronizing low-rank matrices instead. Depending on the rank fraction used, we can greatly compress the amount of communication needed while producing the exact same end result (up to numerical precision). This technique originates from PowerSGD---see [Vogels et al., 2019](https://arxiv.org/abs/1905.13727) for more details.
 
 This feature is applicable across any replicated data-parallel axis for DDP and hybrid-sharded HSDP. It can be enabled or disabled using the `replicate_mesh_grad_sync` option.
 
@@ -366,16 +366,42 @@ for data in dataloader:
 
 ### Checkpointing
 
-TODO
+Dion requires synchronizing optimizer state before saving a checkpoint. Because of Dion's decoupled momentum, internal optimizer states will be different across the replicate mesh. Call the `synchronize_for_checkpoint()` function to explicitly perform an all-reduce of optimizer states. This ensures the consistency of distributed checkpoints, since typically each state will only be saved by one process along the replicated data-parallel mesh. This function will be a no-op if `replicate_mesh_grad_sync=False` or no replicate mesh is used.
 
 If model parameters are `DTensor` type, the optimizer states will also be `DTensor`s. Checkpoints should be saved using [torch.distributed.checkpoint](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html).
+
+```python
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict
+
+optimizer = Dion(
+    param_groups,
+    replicate_mesh = mesh["dp"],
+    replicate_mesh_grad_sync=True,
+    ...
+)
+
+# Train the model
+loss = model(data)
+loss.backward()
+optimizer.step()
+model.zero_grad()
+
+# Call this before checkpointing
+optimizer.synchronize_for_checkpoint()
+
+# Save a distributed checkpoint
+model_state_dict, opt_state_dict = get_state_dict(model, optimizer)
+checkpoint = { "model": model_state_dict, "optimizer": opt_state_dict }
+dcp.save(checkpoint, ...)
+```
 
 
 ## Best Practices
 
 * **Dion rank fraction:** The most important Dion-specific hyperparameter is the *rank fraction*, which controls the amount of low-rank compression. Setting `rank_fraction=1.0` resulting in full-rank updates without any compression, similar to Muon. Empirically, it appears that larger models are more tolerant of low-rank compression. At 3B parameters, `rank_fraction=0.25` (1/4 rank) achieves nearly equivalent performance as full-rank, and we expect that 1/8, 1/16, and perhaps lower rank fractions will work well at 10B+ scale.
 * **Lion vs. AdamW:** We have found that Lion performs better than AdamW for optimizing scalar parameters when used with Dion/Muon for orthonormal matrix updates.
-* **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension must be manually selected when applied on top of TP. See `models/gpt_model.py` for an example of explicitly specifying the shard dimension for `fully_shard()`. Double-sharded matrices along the same dimension will raise an error in Dion.
+* **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension needs to be manually specified when applied on top of TP. See `models/gpt_model.py` for an example of explicitly providing `fully_shard()` with per-parameter shard dimensions. Double-sharded matrices along the same dimension will raise an error in Dion.
 * **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
 * **Nesterov momentum:** In Muon, we set Nesterov momentum to `False` by default, as we observed better performance without it. Dion does not implement Nesterov momentum.
 

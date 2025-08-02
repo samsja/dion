@@ -8,7 +8,7 @@ from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor, Placement, Replicate, Shard
 from torch.distributed.tensor import randn as dtensor_randn
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Any, Dict, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional, Union
 
 from .opt_utils import to_local
 from .scalar_opts import adamw_update, lion_update
@@ -362,6 +362,36 @@ class Dion(Optimizer):
                     raise ValueError(f"Unknown algorithm: {algo}")
 
         return loss
+
+    @torch.no_grad()
+    def synchronize_for_checkpoint(self):
+        """
+        Synchronize the internal optimizer states across the replicated mesh.
+
+        Dion uses compressed gradient synchronization with decoupled momentum, which
+        results in optimizer states diverging across the replicated data-parallel mesh.
+        To ensure consistency of distributed checkpoints, we must manually synchronize
+        the optimizer states before saving a checkpoint. If replicate_mesh is None or
+        replicate_mesh_grad_sync is False, this function is a no-op.
+        """
+
+        if self._replicate_mesh is None or not self._replicate_mesh_grad_sync:
+            # Nothing to do
+            return
+
+        # Get all tensors in optimizer states
+        state_tensors: List[Tensor] = []
+        for state in self.state.values():
+            assert isinstance(state, dict)
+            for val in state.values():
+                if isinstance(val, Tensor):
+                    state_tensors.append(val)
+
+        # All-reduce each tensor in the optimizer state
+        for tensor in state_tensors:
+            tensor = to_local(tensor)
+            result = all_reduce(tensor, self._replicate_mesh)
+            tensor.copy_(result)
 
     def _get_dion_param_config(self, x: Tensor) -> DionParamConfig:
         """
@@ -935,7 +965,7 @@ def all_reduce(
 
     if isinstance(tensor, DTensor):
         assert isinstance(reduce_mesh, DeviceMesh)
-        # All-reduce local shard over each specified dimension
+        # All-reduce local shard over the device mesh
         tensor_local = funcol.all_reduce(
             tensor.to_local(),
             reduceOp=reduce_op,

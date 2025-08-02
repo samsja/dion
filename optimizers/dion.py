@@ -270,6 +270,46 @@ class Dion(Optimizer):
 
         return loss
 
+    @torch.no_grad()
+    def synchronize_for_checkpoint(self):
+        """
+        Synchronize the internal optimizer states across the replicated mesh.
+
+        Dion uses compressed gradient synchronization with decoupled momentum, which
+        results in optimizer states diverging across the replicated data-parallel mesh.
+        To ensure consistency of distributed checkpoints, we must manually synchronize
+        the optimizer states before saving a checkpoint. If replicate_mesh is None or
+        replicate_mesh_grad_sync is False, this function is a no-op.
+        """
+
+        if self._replicate_mesh is None or not self._replicate_mesh_grad_sync:
+            # Nothing to do
+            return
+
+        # Get all tensors in optimizer states
+        state_tensors: List[Tensor] = []
+        for state in self.state.values():
+            assert isinstance(state, dict)
+            for val in state.values():
+                if isinstance(val, Tensor):
+                    state_tensors.append(val)
+
+        # Heuristic to determine a reasonable batch size
+        if self._inner_shard_mesh is not None:
+            batch_size = self._inner_shard_mesh.size()
+        elif self._outer_shard_mesh is not None:
+            batch_size = self._outer_shard_mesh.size()
+        else:
+            batch_size = self._replicate_world_size
+
+        # Batching allows for coalesced all-reduce
+        for batch in create_param_batches(state_tensors, batch_size):
+            batch = to_local(batch)
+            reduced_batch = all_reduce_replicate_mesh(
+                batch, self._replicate_mesh, return_dtensor=False
+            )
+            torch._foreach_copy_(batch, reduced_batch)
+
     def _create_dion_tasks(
         self,
         param_groups: List[dict],
@@ -1126,26 +1166,27 @@ def all_reduce_replicate_mesh(
     G: Union[Tensor, List[Tensor]],
     replicate_mesh: Optional[DeviceMesh] = None,
     return_dtensor: bool = True,
+    reduce_op: str = "avg",
 ) -> Union[Tensor, List[Tensor]]:
     """
     All-reduce a tensor or list of tensors across replicated data-parallel ranks.
     """
     if replicate_mesh is None:
-        # No data parallelism, return gradients unmodified
+        # No data parallelism, return original tensors unmodified
         return G
 
     if isinstance(G, Tensor):
         # Single tensor
         result_local = funcol.all_reduce(
             to_local(G),
-            reduceOp="avg",
+            reduceOp=reduce_op,
             group=replicate_mesh,
         )
     else:
         # List of tensors, use coalesced all-reduce
         result_local = funcol.all_reduce_coalesced(
             to_local(G),
-            reduceOp="avg",
+            reduceOp=reduce_op,
             group=replicate_mesh,
         )
 
