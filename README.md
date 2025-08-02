@@ -139,7 +139,7 @@ We summarize the above in this table. Let `d_in` be the input dimension of the u
 | Embedding     | `nn.Embedding.weight`                       | `"lion"` / `"adamw"`  | `lr`                   |
 | Unembedding   | `nn.Linear.weight` (must identify manually) | `"lion"` / `"adamw"`  | `lr / math.sqrt(d_in)` |
 
-We emphasize again that particular care needs to be taken with embedding and unembedding layers. They must be isolated from ordinary matrix parameters, and the unembedding layer futhermore should use a scaled learning rate. Merely checking the dimensions of a parameter (such as `if p.ndim == 2`) or the type of the module (such as `if isinstance(module, nn.Linear)`) **is not sufficient** to identify these special parameters. This is why we require manual parameter group creation.
+We emphasize again that **particular care** needs to be taken with **embedding and unembedding layers**. They must be isolated from ordinary matrix parameters, and the unembedding layer futhermore should use a scaled learning rate. Merely checking the dimensions of a parameter (such as `if p.ndim == 2`) or the type of the module (such as `if isinstance(module, nn.Linear)`) **is not sufficient** to identify these special parameters. This is why we require manual parameter group creation.
 
 The optimizer cannot tell if a given parameter is a weight matrix, embedding, or unembedding, because they are all two-dimensional tensors. You will not receive any errors if these parameters are incorrectly grouped with matrix weights!
 
