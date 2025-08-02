@@ -193,9 +193,9 @@ In order for our efficient distributed optimizers to work, they must know about 
 
 ### Device Mesh for Dion
 
-Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The `outer_shard_mesh` will be unsharded before entering Dion's orthogonalization sub-routine, while the `inner_shard_mesh` remains sharded throughout orthogonalization. The `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
+Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The sharded meshes are referred to as `outer_shard_mesh` and `inner_shard_mesh`. Dion's internal optimizer states can be sharded over both meshes. During the update computation, the low-rank matrix orthonormalized by Dion is replicated across `outer_shard_mesh` but remains sharded across `inner_shard_mesh`. Thus, the `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
 
-Unused meshes may be omitted or given as `None`. If only one sharding dimension is used (e.g. only FSDP without TP), we recommend providing it as the `outer_shard_mesh`.
+Unused meshes may be omitted or given as `None`. If only one sharding dimension is used (e.g. only FSDP without TP), we recommend providing it as the `outer_shard_mesh`. Dion will execute a faster single-device orthonormalization routine in this case, since the input matrix to be orthonormalized will not be sharded.
 
 ```python
 # Example with a 3D mesh
@@ -231,8 +231,8 @@ fully_shard(model, mesh=fs_mesh)
 
 optimizer = Dion(
     param_groups,
-    replicate_mesh = None,          # Replicated data parallel
-    outer_shard_mesh = fs_mesh,     # Sharded data parallel
+    replicate_mesh = None,          # No replicated data parallel used
+    outer_shard_mesh = fs_mesh,     # Sharded data parallel across flattened mesh
     inner_shard_mesh = mesh["tp"],  # Tensor parallel
     ...
 )
@@ -265,7 +265,7 @@ optimizer = Muon(
 
 ### Usage with ProcessGroup for DDP
 
-Training with DistributedDataParallel (DDP) is also supported. Pass in the DDP-wrapped model's `process_group` instead of a device mesh. This will allow the optimizer to efficiently distribute work across all GPUs.
+Training with DistributedDataParallel (DDP) is also supported. Pass in the DDP-wrapped model's `process_group` instead of a device mesh. This will allow the optimizer to efficiently distribute work across all GPUs. If no `process_group` is provided, the optimizer will run in single-GPU mode, and every device in the DDP world will redundantly perform the same work.
 
 ```python
 ddp_model = DistributedDataParallel(model, ...)
@@ -293,6 +293,8 @@ This feature is applicable across any replicated data-parallel axis for DDP and 
 * If `replicate_mesh_grad_sync` is True (default) and a `replicate_mesh` is provided, Dion will all-reduce the low-rank compressed states during the optimizer step.
 * If `replicate_mesh_grad_sync` is False, Dion will expect that all data-parallel gradients have already been synchronized prior to the optimizer step.
 
+Note that `replicate_mesh_grad_sync=True` results in *decoupled momentum*. The optimizer's internal momentum states will diverge across data-parallel processes. (Model weight updates always remain identical.) Before saving a checkpoint, you must explicitly tell Dion to synchronize internal states. See the [Checkpointing](#checkpointing) section for more details.
+
 ### Usage with HSDP
 
 Typically, hybrid sharding with `fully_shard()` uses a 2D device mesh. To use with Dion's compressed gradient synchronization, pass only the sharded sub-mesh to `fully_shard()`.
@@ -310,7 +312,7 @@ Note that if we choose to disable Dion's compressed gradient synchronization, we
 
 ```python
 # ------------------------------------------------------------
-#  Mode 1: Dion handles DP sync (compressed P/Q)  <-- recommended
+#  Mode 1: Dion handles DP sync (low-rank compressed matrices)
 # ------------------------------------------------------------
 mesh = init_device_mesh("cuda", (dp, fs), ("dp", "fs"))
 
@@ -365,6 +367,8 @@ for data in dataloader:
 ### Checkpointing
 
 TODO
+
+If model parameters are `DTensor` type, the optimizer states will also be `DTensor`s. Checkpoints should be saved using [torch.distributed.checkpoint](https://docs.pytorch.org/docs/stable/distributed.checkpoint.html).
 
 
 ## Best Practices
