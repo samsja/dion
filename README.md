@@ -86,7 +86,7 @@ With the appropriate configuration, you should be able to reproduce the results 
 
 ## Introduction
 
-Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW, but recent works have shown the potential for *matrix orthonormalization* to accelerate model convergence.
+Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW. However, recent work has shown that incorporating a **matrix orthonormalization update rule** can significantly accelerate model convergence. See [Bernstein-Newhouse 2025](https://openreview.net/forum?id=hErdffTsLu&referrer=%5Bthe+profile+of+Jeremy+Bernstein%5D%28%2Fprofile%3Fid%3D%7EJeremy_Bernstein1%29) for theoertical justification.  
 
 The technique of orthonormal weight updates was first pioneered by [Muon](https://kellerjordan.github.io/posts/muon/), achieved success on the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has recently been demonstrated at scale by [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon performs orthonormalization using Newton-Schulz iteration, involving repeated matrix-matrix multiplication. However, large-scale training uses model sharding, where weight matrices and optimizer states are split across a network of distributed processes. Orthonormalizing a matrix in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
