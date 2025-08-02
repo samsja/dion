@@ -18,7 +18,7 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 1. [Distributed Training Configuration](#distributed-training-configuration)
    * [Flattened Meshes](#flattened-meshes)
    * [Device Mesh for Muon](#device-mesh-for-muon)
-   * [Usage with ProcessGroup for DDP](#usage-with-processgroup-for-ddp)
+   * [Usage with DDP ProcessGroup](#usage-with-ddp-processgroup)
 1. [Compressed Data-Parallel Gradient Sync](#compressed-data-parallel-gradient-sync)
    * [Usage with HSDP](#usage-with-hsdp)
    * [Example Code](#example-code-1)
@@ -59,9 +59,9 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yam
 ```
 This will launch Distributed Data Parallel (DDP) training.
 
-### Advanced FSDP / TP / Hybrid Training
+### Advanced FSDP / TP / Hybrid Sharded Training
 
-To enable more advanced distributed strategies such as FSDP (Fully Sharded Data Parallel) and Tensor Parallelism, you can specify the configuration in the `dion_160m.yaml` file: 
+To enable more advanced distributed strategies such as Fully Sharded Data Parallel (FSDP) and Tensor Parallelism (TP), you can specify the configuration in the `dion_160m.yaml` file: 
 
 ```yaml
 # — Distributed training —
@@ -72,7 +72,7 @@ tp_size: 2      # tensor‐parallel size
 
 This example sets up a hybrid configuration with DDP × FSDP × TP = 2 × 2 × 2.
 
-Alternatively, you can override these values directly from the command line:
+Alternatively, you can override these values directly from the command line. All three values must be explicitly given, but a size may be set to `1` to omit a parallelism dimension.
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml \
@@ -88,16 +88,14 @@ With the appropriate configuration, you should be able to reproduce the results 
 
 Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW. However, recent work has shown that incorporating a **matrix orthonormalization update rule** can significantly accelerate model convergence. See [[Bernstein-Newhouse 2025]](https://openreview.net/forum?id=hErdffTsLu&referrer=%5Bthe+profile+of+Jeremy+Bernstein%5D%28%2Fprofile%3Fid%3D%7EJeremy_Bernstein1%29) for theoertical justification.  
 
-The practical effectiveness of the orthonormal update rule was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via the *Newton–Schulz iteration*, which relies on repeated matrix–matrix multiplications. 
+The practical effectiveness of orthonormal updates was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via the *Newton-Schulz iteration*, which relies on repeated matrix–matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As extensively discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a matrix with Newton-Schulz iterations in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
-However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As extensively discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a matrix with Newton–Schulz iterations in this scenario involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
-
-**Dion** is our approach for a more **scalable and communication-efficient** optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses an alternative orthonormalization method based on amortized power iteration (in the style of [PowerSGD](https://arxiv.org/pdf/1905.13727)), which can be applied directly on sharded matrices. Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
+**Dion** is our approach for a more **scalable and communication-efficient** optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses an alternative orthonormalization method based on amortized power iteration (in the style of [PowerSGD](https://arxiv.org/pdf/1905.13727)), which can be applied directly on sharded matrices. Furthermore, Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
 
 
 ## Optimizers
 
-Our implementations of Dion (`dion.py`) and Muon (`muon.py`) support the following parallelization techniques:
+Our main implementations of Dion (`dion.py`) and Muon (`muon.py`) support the following parallelization techniques:
 
 | Parallelization    | Dion | Muon |
 |--------------------|------|------|
@@ -108,9 +106,11 @@ Our implementations of Dion (`dion.py`) and Muon (`muon.py`) support the followi
 
 For faster performance, both of these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
-In addition, we provide the following alternative implementations:
+We include Dion, Muon, and several alternative implementations of the optimizers in the `optimizers/` directory of this repo.
  
-* `dion_reference.py`: An implementation without batching or communication overlapping, intended to closely follow the algorithms as described in our [Dion paper](https://arxiv.org/pdf/2504.05295).
+* `dion.py`: High-performance version of Dion. Depending on how each batch of matrices is sharded, we select the best communication patterns to compute Dion's orthonormal update. All-reduce operations may be split into reduce-scatter and all-gather across the batch dimension to more efficiently distribute work and avoid redundant computation.
+* `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
+* `dion_reference.py`: An implementation without batching, communication overlapping, or split all-reduce. This version of Dion is intended to closely follow the algorithms as described in our [Dion paper](https://arxiv.org/pdf/2504.05295).
 * `dion_simple.py`: A simplified illustration of the Dion update rule in a single Python function, provided for educational value.
 * `muon_reference.py`: A version of Muon by [Moonshot AI](https://github.com/MoonshotAI/Moonlight), modified to take similar arguments as `muon.py`.
 
@@ -263,9 +263,9 @@ optimizer = Muon(
 )
 ```
 
-### Usage with ProcessGroup for DDP
+### Usage with DDP ProcessGroup
 
-Training with DistributedDataParallel (DDP) is also supported. Pass in the DDP-wrapped model's `process_group` instead of a device mesh. This will allow the optimizer to efficiently distribute work across all GPUs. If no `process_group` is provided, the optimizer will run in single-GPU mode, and every device in the DDP world will redundantly perform the same work.
+Training with DistributedDataParallel (DDP) is also supported. DDP uses PyTorch `ProcessGroup` instead of `DeviceMesh`, which is stored in the DDP-wrapped model's `process_group` field. Providing this to the optimizer will allow it to efficiently distribute work across all GPUs. If no `process_group` is provided, the optimizer will run in single-GPU mode, and every device in the DDP world will redundantly perform the same work.
 
 ```python
 ddp_model = DistributedDataParallel(model, ...)
@@ -378,14 +378,13 @@ If model parameters are `DTensor` type, the optimizer states will also be `DTens
 * **2D sharding:** If weights are sharded with both FSDP and TP, it is required that the sharding methods are applied to different matrix dimensions. The TP sharding dimension is controlled via `RowwiseParallel` and `ColwiseParallel`, but the FSDP sharding dimension must be manually selected when applied on top of TP. See `models/gpt_model.py` for an example of explicitly specifying the shard dimension for `fully_shard()`. Double-sharded matrices along the same dimension will raise an error in Dion.
 * **Learning rate scaling:** Dion will automatically scale the provided learning rate by `sqrt(d_out / d_in)` for matrix parameters. Muon will apply the same scaling by default, but also supports the `0.2 * sqrt(max(d_in, d_out))` scale factor recommended by Moonshot AI. Our default scale factor is intended to induce a consistent change to activation vector values, which enables learning rate transfer across model size. See [Deriving Muon](https://jeremybernste.in/writing/deriving-muon) for more information.
 * **Nesterov momentum:** In Muon, we set Nesterov momentum to `False` by default, as we observed better performance without it. Dion does not implement Nesterov momentum.
-* **Other hyperparameters:** TODO
 
 
 ## Experimental Features
 
 ### Mixed Precision Dion
 
-By default, Dion will initialize its optimizer states to use the same data type as the model's parameters. The `DionMixedPrecisionConfig` class may be used to specify custom data types. In our preliminary experiments, we have found that using `torch.bfloat16` for Dion's optimizer states can reduce memory use and speed up computation with no impact to training stability.
+By default, Dion will initialize its optimizer states to use the same data type as the model's parameters. The `DionMixedPrecisionConfig` class may be used to specify custom data types. In preliminary experiments, we have found that using `torch.bfloat16` for Dion's optimizer states can reduce memory use and speed up computation with no impact on training stability.
 
 ```python
 from dion import Dion, DionMixedPrecisionConfig
