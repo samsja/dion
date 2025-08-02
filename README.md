@@ -51,10 +51,33 @@ Download pretokenized FineWeb dataset:
 python data/cached_fineweb10B.py 16
 ```
 
-Example for training a GPT-small model with Dion (replace 8 with the number of GPUs on your machine):
+### Distributed Data Parallel (DDP) Training
+
+To train a GPT-small model using Dion with 8 GPUs (adjust as needed for your setup):
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml
-``` 
+```
+This will launch Distributed Data Parallel (DDP) training.
+
+### Advanced FSDP / TP / Hybrid Training
+
+To enable more advanced distributed strategies such as FSDP (Fully Sharded Data Parallel) and Tensor Parallelism, you can specify the configuration in the `dion_160m.yaml` file: 
+
+```yaml
+# — Distributed training —
+dp_size: 2      # data‐parallel size
+fs_size: 2      # FSDP size
+tp_size: 2      # tensor‐parallel size
+```
+
+This example sets up a hybrid configuration with DDP × FSDP × TP = 2 × 2 × 2.
+
+Alternatively, you can override these values directly from the command line:
+
+```bash
+torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml \
+  --dp_size 2 --fs_size 2 --tp_size 2
+```
 
 After the training you should be able to reproduce the first plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
 
