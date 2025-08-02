@@ -117,7 +117,7 @@ In addition, we provide the following alternative implementations:
 
 ## Building Parameter Groups
 
-Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups. These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Non-matrix parameters require a different scalar optimizer algorithm (element-wise updates) and may also use a different learning rate. We currently support Lion and AdamW.
+Unlike typical PyTorch optimizers (e.g. `Adam`/`AdamW`), Dion and Muon require separating your model's parameters into different groups (same in spirit as [Modula](https://docs.modula.systems/)). These orthonormal optimization algorithms are only applicable to two-dimensional matrix weights. Non-matrix parameters require a different scalar optimizer algorithm (element-wise updates) and may also use a different learning rate. We currently support Lion and AdamW.
 
 The details of parameter grouping are dependent on model architecture and implementation. Therefore, we leave it up to you to categorize your model's parameters and create the necessary parameter groups.
 
