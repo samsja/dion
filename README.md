@@ -79,7 +79,9 @@ torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yam
   --dp_size 2 --fs_size 2 --tp_size 2
 ```
 
-After the training you should be able to reproduce the first plot in [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
+####  Example Weights & Biases (wandb) Plots
+
+With the appropriate configuration, you should be able to reproduce the results shown in the [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
 
 
 ## Introduction
