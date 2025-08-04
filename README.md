@@ -457,5 +457,3 @@ If you use Dion in your research, please cite:
   year={2025}
 }
 ``` 
-
-LocalWords:  Orthonormal
