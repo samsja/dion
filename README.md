@@ -41,14 +41,27 @@ This code is written for modern PyTorch (version 2.7 or newer) using DTensor-bas
 
 ## Quick Start
 
-Install dependencies for Dion and training script:
-```bash
-pip install -e .[train]
-```
+Dion and Muon optimizers are available as a `pip` package! Install to use in your project:
 
-Optimizers can also be installed in a standalone mode without the training script:
 ```bash
 pip install git+https://github.com/microsoft/dion.git
+```
+
+Then in your code, you can use:
+
+```python
+from dion import Dion, Muon
+```
+
+Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, like `Adam`/`AdamW`.
+
+### Running Our Sample Training Script
+
+First clone this repo, then install dependencies for both Dion and training code:
+```bash
+git clone https://github.com/microsoft/dion.git
+cd dion
+pip install -e .[train]
 ```
 
 Download pretokenized FineWeb dataset:

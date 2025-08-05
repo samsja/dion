@@ -7,16 +7,16 @@ req_path = os.path.join(this_directory, "requirements_dion.txt")
 req_dev_path = os.path.join(this_directory, "requirements_dev.txt")
 req_train_path = os.path.join(this_directory, "requirements_train.txt")
 
+
 def read_requirements(path):
     if not os.path.exists(path):
         print(f"Warning: requirements file {path} does not exist.")
         return []
     with open(path) as fp:
         return [
-            line.strip()
-            for line in fp
-            if line.strip() and not line.startswith("#")
+            line.strip() for line in fp if line.strip() and not line.startswith("#")
         ]
+
 
 # requirements_dion contains the dependencies for the standalone optimizer
 install_requires = read_requirements(req_path)
@@ -51,10 +51,10 @@ setup(
     #     "dion": ["VERSION"],  # Add the VERSION file
     # },
     # Author information:
-    author="Ahn, Kwangjun and Xu, Byron and Abreu, Natalie and Langford, John", # as listed in the paper
-    author_email="{kwangjunahn, byronxu}@microsoft.com", # left this form to prevent bots from harvesting emails
+    author="Ahn, Kwangjun and Xu, Byron and Abreu, Natalie and Langford, John",  # as listed in the paper
+    author_email="{kwangjunahn, byronxu}@microsoft.com",  # left this form to prevent bots from harvesting emails
     # Description of the package:
-    description="Dion: Distributed Orthonormal Updates.",
+    description="Dion: Distributed Orthonormal Updates",
     long_description=readme_contents,
     long_description_content_type="text/markdown",
     # Plugins entry point
@@ -66,7 +66,7 @@ setup(
     license="MIT",
     install_requires=install_requires,
     extras_require={
-        "dev": install_dev_requires, # Can be installed with `pip install dion[dev]`
+        "dev": install_dev_requires,  # Can be installed with `pip install dion[dev]`
         "train": install_train_requires,
     },
 )
