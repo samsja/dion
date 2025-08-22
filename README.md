@@ -66,7 +66,7 @@ pip install -e .[train]
 
 Download pretokenized FineWeb dataset:
 ```bash
-python data/cached_fineweb10B.py 16
+python data/cached_fineweb10B.py 30
 ```
 
 ### Distributed Data Parallel (DDP) Training
