@@ -594,7 +594,7 @@ def muon_update_newton_schulz(
 def adjust_lr_rms_norm(lr, param_shape):
     # Adjust learning rate for constant element-wise RMS norm
     # https://arxiv.org/abs/2502.16982
-    A, B = param_shape[:2]
+    A, B = param_shape[-2:]
     adjusted_ratio = 0.2 * math.sqrt(max(A, B))
     adjusted_lr = lr * adjusted_ratio
     return adjusted_lr
@@ -603,10 +603,16 @@ def adjust_lr_rms_norm(lr, param_shape):
 def adjust_lr_spectral_norm(lr, param_shape):
     # Adjust from spectral norm 1 to RMS operator norm 1
     # https://arxiv.org/abs/2310.17813
-    fan_out, fan_in = param_shape[:2]
+    fan_out, fan_in = param_shape[-2:]
     adjusted_lr = lr * math.sqrt(fan_out / fan_in)
     return adjusted_lr
 
+def adjust_lr_keller_muon(lr, param_shape):
+    # Adjust from spectral norm 1 to RMS operator norm 1
+    # https://arxiv.org/abs/2310.17813
+    fan_out, fan_in = param_shape[-2:] # need -2: instead of 2: because it would break experts params that are 3d
+    adjusted_lr = lr * max(1, fan_out / fan_in)**0.5
+    return adjusted_lr
 
 @torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
