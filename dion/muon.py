@@ -74,9 +74,9 @@ class Muon(Optimizer):
             raise ValueError(f"Invalid momentum factor (mu): {mu}")
         if len(betas) != 2 or betas[0] < 0.0 or betas[1] < 0.0:
             raise ValueError(f"Invalid betas: {betas}")
-        if adjust_lr not in ("spectral_norm", "rms_norm", None):
+        if adjust_lr not in ("spectral_norm", "rms_norm", "keller_muon", None):
             raise ValueError(
-                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', or None."
+                f"Invalid adjust_lr value: {adjust_lr}. Must be 'spectral_norm', 'rms_norm', 'keller_muon', or None."
             )
 
         # Default arguments for each param group
@@ -471,6 +471,8 @@ def muon_update_batch_async(
         adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape)
     elif adjust_lr == "rms_norm":
         adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape)
+    elif adjust_lr == "keller_muon":
+        adjusted_lr = adjust_lr_keller_muon(lr, X[0].shape)
     else:
         raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
