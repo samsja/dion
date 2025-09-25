@@ -1264,7 +1264,7 @@ def generate_random_sketch_matrix(
 
 
 # Graph break in torch.compile due to DTensor RNG
-@torch.compile()
+# @torch.compile()
 def orthogonalize(P: Tensor, oversample: float = 1.25) -> Tensor:
     """
     Orthogonalize a batch of matrices.
@@ -1309,7 +1309,7 @@ def orthogonalize(P: Tensor, oversample: float = 1.25) -> Tensor:
 
 
 # Graph break in torch.compile due to DTensor RNG
-@torch.compile()
+# @torch.compile()
 def distributed_orthogonalize(
     P: DTensor, oversample: float = 1.25, shard_mesh_dim: Optional[int] = None
 ) -> DTensor:
@@ -1413,7 +1413,7 @@ def distributed_orthogonalize(
     return P
 
 
-@torch.compile(fullgraph=True)
+# @torch.compile(fullgraph=True)
 def fix_all_zero_or_nan(
     P: Tensor,  # Output of power iteration
     R: Tensor,  # Output of power iteration
