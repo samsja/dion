@@ -521,7 +521,7 @@ def lion_update_foreach_async(
     yield
 
 
-#@torch.compile(fullgraph=True)
+##@torch.compile(fullgraph=True)
 def muon_update_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
@@ -552,7 +552,7 @@ def muon_update_pre_orthogonalize(
     return U
 
 
-#@torch.compile(fullgraph=True)
+##@torch.compile(fullgraph=True)
 def muon_update_post_orthogonalize(
     X: List[Tensor],
     U: List[Tensor],
@@ -616,7 +616,7 @@ def adjust_lr_keller_muon(lr, param_shape):
     adjusted_lr = lr * max(1, fan_out / fan_in)**0.5
     return adjusted_lr
 
-#@torch.compile(fullgraph=True)
+##@torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     """
     Newton-Schulz iteration to approximate the orthogonalization of X.
