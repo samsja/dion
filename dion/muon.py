@@ -238,32 +238,53 @@ class Muon(Optimizer):
                         sharded_mesh_dim = shard_placements[0][0]
                         sharded_tensor_dim = shard_placements[0][1].dim
                     elif len(shard_placements) > 1:
-                        # Experts case: EP (dim 0) + FSDP (dim 1)
-                        # EP shards on dim 0 (num_experts) - no gradient sync needed)
-                        # FSDP shards on dim 1 - gradients reduce over FSDP mesh
-                        # Use FSDP sharding (non-dim-0)
-                        fsdp_placements = [
-                            (i, p) for i, p in shard_placements 
-                            if p.dim != 0  # EP shards on dim 0, FSDP on other dims
-                        ]
+                        # Multiple sharded dimensions - likely EP + FSDP
+                        # Find which sharding corresponds to the optimizer's process group (FSDP)
+                        # This is robust against mesh dimension ordering (e.g. FSDP dim 0 vs 1)
                         
-                        if len(fsdp_placements) != 1:
+                        fsdp_placements = []
+                        try:
+                            optimizer_ranks = set(dist.get_process_group_ranks(self._process_group))
+                            
+                            for i, p in shard_placements:
+                                pg = params[0].device_mesh.get_group(i)
+                                pg_ranks = set(dist.get_process_group_ranks(pg))
+                                
+                                if pg_ranks == optimizer_ranks:
+                                    fsdp_placements.append((i, p))
+                        except (AttributeError, RuntimeError):
+                            # Fallback for older PyTorch or if getting ranks fails
+                            # Heuristic: exclude dim 0 sharding (likely EP) if possible
+                            # But here we just check world size match
+                            opt_size = dist.get_world_size(self._process_group)
+                            for i, p in shard_placements:
+                                pg = params[0].device_mesh.get_group(i)
+                                if dist.get_world_size(pg) == opt_size:
+                                    # Ambiguous if both dims have same size, but prefer non-dim-0 sharding if available
+                                    # This is a best-effort fallback
+                                    fsdp_placements.append((i, p))
+                        
+                        if len(fsdp_placements) == 0:
                             raise RuntimeError(
-                                f"Expected exactly one FSDP sharding (non-dim-0) for experts, "
-                                f"but got {len(fsdp_placements)}. Shard placements: {shard_placements}"
+                                f"Could not find sharding that matches optimizer mesh process group. "
+                                f"Shard placements: {shard_placements}"
                             )
+                        elif len(fsdp_placements) > 1:
+                            # If multiple match (e.g. both dims same size), prefer non-tensor-dim-0 (non-EP)
+                            non_ep_matches = [x for x in fsdp_placements if x[1].dim != 0]
+                            if len(non_ep_matches) == 1:
+                                fsdp_placements = non_ep_matches
+                            else:
+                                raise NotImplementedError(
+                                    f"Ambiguous sharding: multiple dimensions match optimizer process group. "
+                                    f"Matches: {fsdp_placements}"
+                                )
                         
                         sharded_mesh_dim = fsdp_placements[0][0]
                         sharded_tensor_dim = fsdp_placements[0][1].dim
                         
-                        # Verify FSDP sharding matches optimizer mesh
-                        fsdp_mesh_group = params[0].device_mesh.get_group(sharded_mesh_dim)
-                        if fsdp_mesh_group != self._process_group:
-                            raise RuntimeError(
-                                f"FSDP sharding (mesh_dim={sharded_mesh_dim}) process group "
-                                f"({fsdp_mesh_group}) does not match optimizer's process group "
-                                f"({self._process_group})"
-                            )
+                        # Verification already done by matching logic
+
 
                     # Check that the sharded mesh dimension matches optimizer's device mesh
                     if (
