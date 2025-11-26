@@ -221,68 +221,68 @@ class Muon(Optimizer):
                 # Get sharding dimension
                 sharded_mesh_dim = None
                 sharded_tensor_dim = None
-                if isinstance(params[0], DTensor):
-                    if not isinstance(self._distributed_mesh, DeviceMesh):
-                        raise RuntimeError(
-                            "Must create optimizer with DeviceMesh if using DTensor parameters."
-                        )
+                # if isinstance(params[0], DTensor):
+                #     if not isinstance(self._distributed_mesh, DeviceMesh):
+                #         raise RuntimeError(
+                #             "Must create optimizer with DeviceMesh if using DTensor parameters."
+                #         )
 
-                    # Find the sharded placement and get its mesh and tensor dimensions
-                    # Skip any Shard() placements on size-1 mesh dimension = Replicate()
-                    shard_placements = [
-                        (i, p)
-                        for i, p in enumerate(params[0].placements)
-                        if p.is_shard() and params[0].device_mesh.size(i) > 1
-                    ]
-                    if len(shard_placements) == 1:
-                        sharded_mesh_dim = shard_placements[0][0]
-                        sharded_tensor_dim = shard_placements[0][1].dim
-                    elif len(shard_placements) > 1:
-                        # Multiple sharded dimensions - likely EP + FSDP
-                        # Find which sharding corresponds to the optimizer's process group (FSDP)
+                #     # Find the sharded placement and get its mesh and tensor dimensions
+                #     # Skip any Shard() placements on size-1 mesh dimension = Replicate()
+                #     shard_placements = [
+                #         (i, p)
+                #         for i, p in enumerate(params[0].placements)
+                #         if p.is_shard() and params[0].device_mesh.size(i) > 1
+                #     ]
+                #     if len(shard_placements) == 1:
+                #         sharded_mesh_dim = shard_placements[0][0]
+                #         sharded_tensor_dim = shard_placements[0][1].dim
+                #     elif len(shard_placements) > 1:
+                #         # Multiple sharded dimensions - likely EP + FSDP
+                #         # Find which sharding corresponds to the optimizer's process group (FSDP)
                         
-                        fsdp_placements = []
-                        # Using get_process_group_ranks is necessary because object identity (pg1 == pg2)
-                        # is unreliable in PyTorch even for identical groups.
-                        optimizer_ranks = set(dist.get_process_group_ranks(self._process_group))
+                #         fsdp_placements = []
+                #         # Using get_process_group_ranks is necessary because object identity (pg1 == pg2)
+                #         # is unreliable in PyTorch even for identical groups.
+                #         optimizer_ranks = set(dist.get_process_group_ranks(self._process_group))
                         
-                        for i, p in shard_placements:
-                            pg = params[0].device_mesh.get_group(i)
-                            pg_ranks = set(dist.get_process_group_ranks(pg))
+                #         for i, p in shard_placements:
+                #             pg = params[0].device_mesh.get_group(i)
+                #             pg_ranks = set(dist.get_process_group_ranks(pg))
                             
-                            if pg_ranks == optimizer_ranks:
-                                fsdp_placements.append((i, p))
-                            # NOTE: If we picked the EP dimension (where pg_ranks != optimizer_ranks),
-                            # Muon would attempt to sync gradients with ranks that hold different experts.
-                            # This would mathematically corrupt training (averaging different params)
-                            # and likely hang/crash due to mismatched collectives or group sizes.
+                #             if pg_ranks == optimizer_ranks:
+                #                 fsdp_placements.append((i, p))
+                #             # NOTE: If we picked the EP dimension (where pg_ranks != optimizer_ranks),
+                #             # Muon would attempt to sync gradients with ranks that hold different experts.
+                #             # This would mathematically corrupt training (averaging different params)
+                #             # and likely hang/crash due to mismatched collectives or group sizes.
                         
-                        if len(fsdp_placements) == 0:
-                            raise RuntimeError(
-                                f"Could not find sharding that matches optimizer mesh process group. "
-                                f"Shard placements: {shard_placements}"
-                            )
-                        elif len(fsdp_placements) > 1:
-                            raise NotImplementedError(
-                                f"Ambiguous sharding: multiple dimensions match optimizer process group. "
-                                f"Matches: {fsdp_placements}"
-                            )
+                #         if len(fsdp_placements) == 0:
+                #             raise RuntimeError(
+                #                 f"Could not find sharding that matches optimizer mesh process group. "
+                #                 f"Shard placements: {shard_placements}"
+                #             )
+                #         elif len(fsdp_placements) > 1:
+                #             raise NotImplementedError(
+                #                 f"Ambiguous sharding: multiple dimensions match optimizer process group. "
+                #                 f"Matches: {fsdp_placements}"
+                #             )
                         
-                        sharded_mesh_dim = fsdp_placements[0][0]
-                        sharded_tensor_dim = fsdp_placements[0][1].dim
+                #         sharded_mesh_dim = fsdp_placements[0][0]
+                #         sharded_tensor_dim = fsdp_placements[0][1].dim
                         
-                        # Verification already done by matching logic
+                #         # Verification already done by matching logic
 
 
-                    # Check that the sharded mesh dimension matches optimizer's device mesh
-                    if (
-                        sharded_mesh_dim is not None
-                        and params[0].device_mesh.get_group(sharded_mesh_dim)
-                        != self._process_group
-                    ):
-                        raise RuntimeError(
-                            f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
-                        )
+                #     # Check that the sharded mesh dimension matches optimizer's device mesh
+                #     if (
+                #         sharded_mesh_dim is not None
+                #         and params[0].device_mesh.get_group(sharded_mesh_dim)
+                #         != self._process_group
+                #     ):
+                #         raise RuntimeError(
+                #             f"Got DTensor sharded over mesh dimension {sharded_mesh_dim} different from the optimizer's device mesh"
+                #         )
 
                 yield AsyncTask(
                     muon_update_batch_async(
