@@ -28,8 +28,9 @@ class Muon(Optimizer):
 
     Args:
         params: Parameters for the optimizer.
-        distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
-            Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
+        world_mesh: The full DeviceMesh containing all mesh dimensions.
+        default_mesh_axis: The default mesh axis name to use for distributed operations.
+            Per-group overrides can be specified via 'mesh_axis' in param groups.
         lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
             For element-wise update rules, this is the actual learning rate and no additional scaling is done.
         mu: Momentum factor for Muon algorithm.
@@ -55,7 +56,8 @@ class Muon(Optimizer):
     def __init__(
         self,
         params: ParamsT,
-        distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]] = None,
+        world_mesh: Optional[DeviceMesh] = None,
+        default_mesh_axis: Optional[str] = None,
         lr: float = 0.01,
         mu: float = 0.95,
         betas: Tuple[float, float] = (0.9, 0.95),
@@ -92,32 +94,28 @@ class Muon(Optimizer):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
-            distributed_mesh=None,  # Per-group mesh override
+            mesh_axis=None,  # Per-group mesh axis override (string, not mesh object)
         )
         super().__init__(params, defaults)
 
-        # Distributed configuration
-        if isinstance(distributed_mesh, DeviceMesh):
-            if distributed_mesh.ndim != 1:
-                raise ValueError(
-                    f"Only 1D DeviceMesh is supported, but got {distributed_mesh.ndim}D. For HSDP, provide the 1D sharded sub-mesh."
-                )
-            self._device_rank = distributed_mesh.get_local_rank()
-            self._world_size = distributed_mesh.size()
-            self._process_group = distributed_mesh.get_group()
-        elif isinstance(distributed_mesh, ProcessGroup):
-            self._device_rank = dist.get_rank(distributed_mesh)
-            self._world_size = dist.get_world_size(distributed_mesh)
-            self._process_group = distributed_mesh
-        elif distributed_mesh is None:
+        # Store world mesh and default axis for runtime mesh resolution
+        self._world_mesh = world_mesh
+        self._default_mesh_axis = default_mesh_axis
+
+        # Compute default mesh info from world_mesh + default_mesh_axis
+        if world_mesh is not None and default_mesh_axis is not None:
+            default_submesh = world_mesh[default_mesh_axis]
+            self._device_rank = default_submesh.get_local_rank()
+            self._world_size = default_submesh.size()
+            self._process_group = default_submesh.get_group()
+        elif world_mesh is None and default_mesh_axis is None:
             self._device_rank = 0
             self._world_size = 1
             self._process_group = None
         else:
-            raise TypeError(
-                f"Invalid distributed_mesh type: {type(distributed_mesh)}. Expected DeviceMesh or ProcessGroup."
+            raise ValueError(
+                "world_mesh and default_mesh_axis must both be provided or both be None"
             )
-        self._distributed_mesh = distributed_mesh
 
         # Newton-Schulz configuration
         if newton_schulz_func is not None:
@@ -131,24 +129,21 @@ class Muon(Optimizer):
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
-    def _get_mesh_info(
-        self, mesh: Optional[Union[DeviceMesh, ProcessGroup]]
+    def _get_mesh_info_for_axis(
+        self, mesh_axis: Optional[str]
     ) -> Tuple[int, int, Optional[ProcessGroup]]:
-        """Extract device_rank, world_size, process_group from a mesh."""
-        if isinstance(mesh, DeviceMesh):
-            if mesh.ndim != 1:
-                raise ValueError(
-                    f"Only 1D DeviceMesh is supported, but got {mesh.ndim}D."
-                )
-            return mesh.get_local_rank(), mesh.size(), mesh.get_group()
-        elif isinstance(mesh, ProcessGroup):
-            return dist.get_rank(mesh), dist.get_world_size(mesh), mesh
-        elif mesh is None:
-            return 0, 1, None
-        else:
-            raise TypeError(
-                f"Invalid mesh type: {type(mesh)}. Expected DeviceMesh or ProcessGroup."
+        """Extract device_rank, world_size, process_group for a given mesh axis."""
+        if mesh_axis is None:
+            # Use default mesh info
+            return self._device_rank, self._world_size, self._process_group
+        
+        if self._world_mesh is None:
+            raise ValueError(
+                f"mesh_axis '{mesh_axis}' specified but world_mesh is None"
             )
+        
+        submesh = self._world_mesh[mesh_axis]
+        return submesh.get_local_rank(), submesh.size(), submesh.get_group()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -230,14 +225,9 @@ class Muon(Optimizer):
             flatten = group["flatten"]
             adjust_lr = group["adjust_lr"]
 
-            # Use per-group mesh if provided, otherwise fall back to optimizer-level
-            group_mesh = group.get("distributed_mesh")
-            if group_mesh is not None:
-                device_rank, world_size, process_group = self._get_mesh_info(group_mesh)
-            else:
-                device_rank = self._device_rank
-                world_size = self._world_size
-                process_group = self._process_group
+            # Use per-group mesh axis if provided, otherwise fall back to default
+            group_mesh_axis = group.get("mesh_axis")
+            device_rank, world_size, process_group = self._get_mesh_info_for_axis(group_mesh_axis)
 
             # Create batches of parameters of size world_size
             for params in create_param_batches(
