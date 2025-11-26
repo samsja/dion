@@ -92,6 +92,7 @@ class Muon(Optimizer):
             nesterov=nesterov,
             flatten=flatten,
             adjust_lr=adjust_lr,
+            distributed_mesh=None,  # Per-group mesh override
         )
         super().__init__(params, defaults)
 
@@ -129,6 +130,25 @@ class Muon(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
+
+    def _get_mesh_info(
+        self, mesh: Optional[Union[DeviceMesh, ProcessGroup]]
+    ) -> Tuple[int, int, Optional[ProcessGroup]]:
+        """Extract device_rank, world_size, process_group from a mesh."""
+        if isinstance(mesh, DeviceMesh):
+            if mesh.ndim != 1:
+                raise ValueError(
+                    f"Only 1D DeviceMesh is supported, but got {mesh.ndim}D."
+                )
+            return mesh.get_local_rank(), mesh.size(), mesh.get_group()
+        elif isinstance(mesh, ProcessGroup):
+            return dist.get_rank(mesh), dist.get_world_size(mesh), mesh
+        elif mesh is None:
+            return 0, 1, None
+        else:
+            raise TypeError(
+                f"Invalid mesh type: {type(mesh)}. Expected DeviceMesh or ProcessGroup."
+            )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -210,9 +230,18 @@ class Muon(Optimizer):
             flatten = group["flatten"]
             adjust_lr = group["adjust_lr"]
 
-            # Create batches of parameters of size self._world_size
+            # Use per-group mesh if provided, otherwise fall back to optimizer-level
+            group_mesh = group.get("distributed_mesh")
+            if group_mesh is not None:
+                device_rank, world_size, process_group = self._get_mesh_info(group_mesh)
+            else:
+                device_rank = self._device_rank
+                world_size = self._world_size
+                process_group = self._process_group
+
+            # Create batches of parameters of size world_size
             for params in create_param_batches(
-                group_params, batch_size=self._world_size
+                group_params, batch_size=world_size
             ):
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
@@ -286,9 +315,9 @@ class Muon(Optimizer):
 
                 yield AsyncTask(
                     muon_update_batch_async(
-                        X=pad_batch(params, self._world_size),
-                        G=pad_batch(gradients, self._world_size),
-                        M=pad_batch(momentums, self._world_size),
+                        X=pad_batch(params, world_size),
+                        G=pad_batch(gradients, world_size),
+                        M=pad_batch(momentums, world_size),
                         lr=lr,
                         momentum=mu,
                         weight_decay=weight_decay,
@@ -296,10 +325,10 @@ class Muon(Optimizer):
                         nesterov=nesterov,
                         flatten=flatten,
                         adjust_lr=adjust_lr,
-                        device_rank=self._device_rank,
-                        world_size=self._world_size,
+                        device_rank=device_rank,
+                        world_size=world_size,
                         shard_dim=sharded_tensor_dim,
-                        process_group=self._process_group,
+                        process_group=process_group,
                         newton_schulz_func=self._newton_schulz_func,
                     )
                 )
