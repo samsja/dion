@@ -729,6 +729,9 @@ def muon_orthogonalize_update(
             X, newton_schulz_func=newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
 
+    # TODO: when every partition has the same size, the packed rows reshape to
+    # [num_partitions, partition_size, fan_in] and Newton-Schulz runs once on the whole
+    # batch instead of once per partition. Worth doing when something fuses per-head Q/K/V.
     updates = [
         # Newton-Schulz reads the partition many times, so pay for one contiguous copy
         muon_update_newton_schulz(
