@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.optim.optimizer import Optimizer, ParamsT
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Callable, Dict, Generator, List, Mapping, Optional, Sequence, Tuple, Union
 
 from .newton_schulz_triton import newton_schulz_triton
 from .opt_utils import (
@@ -48,6 +48,11 @@ class Muon(Optimizer):
         use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
+        matrix_partitions: Maps a parameter to the sizes of the independent matrices packed
+            along its penultimate dimension, e.g. {qkv_weight: (q_size, k_size, v_size)}.
+            Each partition is orthogonalized on its own and gets its own adjusted learning
+            rate, so a fused parameter is updated exactly like its unfused matrices would be.
+            Parameters absent from this mapping are treated as a single matrix.
 
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
@@ -69,6 +74,7 @@ class Muon(Optimizer):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        matrix_partitions: Optional[Mapping[Tensor, Sequence[int]]] = None,
     ):
         # Check hyperparameters
         if lr < 0.0:
@@ -136,6 +142,30 @@ class Muon(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
+
+        # Matrix partition configuration
+        self._matrix_partitions: Dict[Tensor, Tuple[int, ...]] = {}
+        for param, partitions in (matrix_partitions or {}).items():
+            partitions = tuple(partitions)
+            if not partitions or any(size <= 0 for size in partitions):
+                raise ValueError(f"Matrix partitions must be positive sizes, got {partitions}")
+            if sum(partitions) != param.size(-2):
+                raise ValueError(
+                    f"Matrix partitions {partitions} sum to {sum(partitions)}, but the "
+                    f"parameter's penultimate dimension is {param.size(-2)}"
+                )
+            self._matrix_partitions[param] = partitions
+
+        num_partitioned = sum(
+            1
+            for group in self.param_groups
+            for param in group["params"]
+            if param in self._matrix_partitions
+        )
+        if num_partitioned != len(self._matrix_partitions):
+            raise ValueError(
+                "matrix_partitions contains parameters that were not given to the optimizer"
+            )
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -252,8 +282,12 @@ class Muon(Optimizer):
 
             # Create batches of parameters of size world_size
             for params in create_param_batches(
-                group_params, batch_size=world_size
+                group_params,
+                batch_size=world_size,
+                matrix_partitions=self._matrix_partitions,
             ):
+                # Every parameter in a batch shares the same partitioning
+                partitions = self._matrix_partitions.get(params[0])
                 gradients = [p.grad for p in params]
                 states = [self._get_or_initialize_state(p, algo_name) for p in params]
                 momentums = [s["momentum"] for s in states]
@@ -325,6 +359,7 @@ class Muon(Optimizer):
                         shard_dim=sharded_tensor_dim,
                         process_group=process_group,
                         newton_schulz_func=self._newton_schulz_func,
+                        partitions=partitions,
                     )
                 )
 
@@ -425,6 +460,7 @@ def muon_update_batch_async(
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
+    partitions: Optional[Tuple[int, ...]] = None,  # Independent matrices packed along dim -2
 ) -> Generator[None, None, None]:
     """
     Batched version of Muon update. Batch size should be equal to number of GPUs.
@@ -469,8 +505,9 @@ def muon_update_batch_async(
 
         # Concatentate shards to form a whole matrix to orthogonalize
         single_matrix = torch.cat(single_matrix_shards, dim=shard_dim)
-        single_matrix = muon_update_newton_schulz(
+        single_matrix = muon_orthogonalize_update(
             single_matrix,
+            partitions=partitions,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
@@ -496,8 +533,9 @@ def muon_update_batch_async(
         single_matrix = U[device_rank]
         assert not isinstance(single_matrix, DTensor)
 
-        single_matrix = muon_update_newton_schulz(
+        single_matrix = muon_orthogonalize_update(
             single_matrix,
+            partitions=partitions,
             newton_schulz_func=newton_schulz_func,
             flatten=flatten,
             epsilon=epsilon,
@@ -519,27 +557,29 @@ def muon_update_batch_async(
             assert world_size == 1
             U = [single_matrix]
 
-    # Compute scaled learning rate
-    # Do this before to_local(X) because we use the full tensor shape, not the shard shape
-    if adjust_lr is None:
-        adjusted_lr = lr
-    elif adjust_lr == "spectral_norm":
-        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape)
-    elif adjust_lr == "rms_norm":
-        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape)
-    elif adjust_lr == "keller_muon":
-        adjusted_lr = adjust_lr_keller_muon(lr, X[0].shape)
+    # Scale the learning rate and update model parameters with the orthogonalized output.
+    # Compute the scaling before to_local(X) because it needs the full tensor shape.
+    if partitions is None:
+        muon_update_post_orthogonalize(
+            X=to_local(X),
+            U=U,
+            base_lr=lr,
+            adjusted_lr=adjust_lr_for_shape(lr, X[0].shape, adjust_lr),
+            weight_decay=weight_decay,
+        )
     else:
-        raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
-
-    # Update model parameters with orthogonalized output
-    muon_update_post_orthogonalize(
-        X=to_local(X),
-        U=U,
-        base_lr=lr,
-        adjusted_lr=adjusted_lr,
-        weight_decay=weight_decay,
-    )
+        # Every partition is a matrix of its own shape, so the adjustment varies by row
+        row_lr = partition_row_learning_rates(partitions, X[0].size(-1), lr, adjust_lr)
+        if shard_dim == X[0].ndim - 2:
+            # This device holds the same slice of rows for every parameter in the batch
+            row_lr = torch.tensor_split(row_lr, world_size, dim=0)[device_rank]
+        muon_update_post_orthogonalize_partitioned(
+            X=to_local(X),
+            U=U,
+            base_lr=lr,
+            row_lr=row_lr.unsqueeze(-1).to(X[0].device),
+            weight_decay=weight_decay,
+        )
 
 
 def adamw_update_foreach_async(
@@ -629,6 +669,27 @@ def muon_update_post_orthogonalize(
     torch._foreach_sub_(X, U)
 
 
+@torch.compile(fullgraph=True)
+def muon_update_post_orthogonalize_partitioned(
+    X: List[Tensor],
+    U: List[Tensor],
+    base_lr: Tensor,  # Learning rate (scalar tensor)
+    row_lr: Tensor,  # Adjusted learning rate per row of dimension -2
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+):
+    """
+    Weight decay and weight update for a parameter packing several matrices along
+    dimension -2. Same arithmetic as muon_update_post_orthogonalize, except that the
+    adjusted learning rate varies by row because each partition has its own shape.
+    """
+    # Apply weight decay
+    torch._foreach_mul_(X, 1 - base_lr * weight_decay)
+
+    # Weight update. Foreach ops only accept scalars, so broadcast one tensor at a time.
+    U = [u * row_lr for u in U]
+    torch._foreach_sub_(X, U)
+
+
 def muon_update_newton_schulz(
     X: Tensor,
     newton_schulz_func: Callable,
@@ -647,6 +708,77 @@ def muon_update_newton_schulz(
         X = X.flatten(end_dim=-3)
 
     return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
+
+
+def muon_orthogonalize_update(
+    X: Tensor,
+    partitions: Optional[Tuple[int, ...]],
+    newton_schulz_func: Callable,
+    flatten: bool,
+    epsilon: Tensor,
+) -> Tensor:
+    """
+    Orthogonalize one whole (unsharded) momentum tensor.
+
+    Without partitions this is a single Newton-Schulz over the whole tensor. With
+    partitions, X packs several independent matrices along dimension -2, and each one
+    is orthogonalized on its own.
+    """
+    if partitions is None:
+        return muon_update_newton_schulz(
+            X, newton_schulz_func=newton_schulz_func, flatten=flatten, epsilon=epsilon
+        )
+
+    # TODO: when every partition has the same size, the packed rows reshape to
+    # [num_partitions, partition_size, fan_in] and Newton-Schulz runs once on the whole
+    # batch instead of once per partition. Worth doing when something fuses per-head Q/K/V.
+    updates = [
+        # Newton-Schulz reads the partition many times, so pay for one contiguous copy
+        muon_update_newton_schulz(
+            partition.contiguous(),
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+        for partition in torch.split(X, partitions, dim=-2)
+    ]
+    return torch.cat(updates, dim=-2)
+
+
+def partition_row_learning_rates(
+    partitions: Tuple[int, ...],
+    fan_in: int,
+    lr: Tensor,
+    adjust_lr: Optional[str],
+) -> Tensor:
+    """
+    One adjusted learning rate per row of the penultimate dimension.
+
+    Every partition is a matrix of its own shape, so its adjustment differs. Expressing
+    the adjustment per row lets the caller apply it in the same place, and with the same
+    arithmetic, as the single adjusted learning rate of an unpartitioned parameter.
+    """
+    return torch.cat(
+        [
+            adjust_lr_for_shape(lr, torch.Size((fan_out, fan_in)), adjust_lr).expand(fan_out)
+            for fan_out in partitions
+        ]
+    )
+
+
+def adjust_lr_for_shape(lr: Tensor, param_shape: torch.Size, adjust_lr: Optional[str]) -> Tensor:
+    """
+    Scale the learning rate for a matrix of the given shape.
+    """
+    if adjust_lr is None:
+        return lr
+    if adjust_lr == "spectral_norm":
+        return adjust_lr_spectral_norm(lr, param_shape)
+    if adjust_lr == "rms_norm":
+        return adjust_lr_rms_norm(lr, param_shape)
+    if adjust_lr == "keller_muon":
+        return adjust_lr_keller_muon(lr, param_shape)
+    raise ValueError(f"Unknown adjust_lr value: {adjust_lr}")
 
 
 def adjust_lr_rms_norm(lr, param_shape):
