@@ -12,6 +12,10 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
+# This module intentionally compiles several matrix shapes in one process.
+torch._dynamo.config.recompile_limit = 64
+
+
 from dion import Muon
 
 if "RANK" not in os.environ:
@@ -39,6 +43,42 @@ def make_muon(mesh, params, matrix_partitions=None):
         adjust_lr="rms_norm",
         matrix_partitions=matrix_partitions,
     )
+
+
+def make_local_muon(params, matrix_partitions=None):
+    return Muon(
+        params=[dict(params=params, algorithm="muon")],
+        fsdp_mesh_dim=0,
+        world_mesh=None,
+        lr=0.02,
+        mu=0.95,
+        weight_decay=0.01,
+        adjust_lr="rms_norm",
+        matrix_partitions=matrix_partitions,
+    )
+
+
+def train_sharded_and_local(mesh, shape, shard_dim, partitions=None, steps=3, seed=0):
+    """Compare uneven FSDP Muon updates with the same unsharded update."""
+    torch.manual_seed(seed)
+    placement = [Shard(shard_dim)]
+    weight = torch.randn(shape, device="cuda")
+    sharded = torch.nn.Parameter(distribute_tensor(weight.clone(), mesh, placement))
+    local = torch.nn.Parameter(weight.clone())
+
+    sharded_partitions = {sharded: partitions} if partitions is not None else None
+    local_partitions = {local: partitions} if partitions is not None else None
+    sharded_optimizer = make_muon(mesh, [sharded], sharded_partitions)
+    local_optimizer = make_local_muon([local], local_partitions)
+
+    for _ in range(steps):
+        gradient = torch.randn(shape, device="cuda")
+        sharded.grad = distribute_tensor(gradient, mesh, placement)
+        local.grad = gradient.clone()
+        sharded_optimizer.step()
+        local_optimizer.step()
+
+    return sharded.detach().full_tensor(), local.detach()
 
 
 def train_fused_and_independent(mesh, shape, partitions, shard_dim, steps=3, seed=0):
@@ -91,3 +131,21 @@ def test_expert_partitions_sharded_across_the_expert_dimension(mesh):
 def test_expert_partitions_sharded_across_the_partition_dimension(mesh):
     fused, expected = train_fused_and_independent(mesh, (4, 192, 64), (96, 96), shard_dim=1)
     torch.testing.assert_close(fused, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "shape,shard_dim",
+    [
+        ((3, 8), 0),  # uneven non-empty shards
+        ((1, 8), 0),  # an empty shard on rank 1
+        ((8, 3), 1),  # uneven sharding along the input dimension
+    ],
+)
+def test_uneven_shards_match_unsharded_muon(mesh, shape, shard_dim):
+    sharded, expected = train_sharded_and_local(mesh, shape, shard_dim)
+    torch.testing.assert_close(sharded, expected, rtol=0, atol=0)
+
+
+def test_uneven_partitioned_shards_match_unsharded_muon(mesh):
+    sharded, expected = train_sharded_and_local(mesh, (3, 8), 0, partitions=(1, 2))
+    torch.testing.assert_close(sharded, expected, rtol=0, atol=0)
