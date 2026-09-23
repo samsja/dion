@@ -502,11 +502,12 @@ def muon_update_batch_async(
         assert all(u.size(shard_dim) == local_shard_size for u in U)
 
         def pad_to_size(tensor: Tensor, size: int) -> Tensor:
-            if tensor.size(shard_dim) == size:
+            pad_amount = size - tensor.size(shard_dim)
+            if pad_amount == 0:
                 return tensor
-            pad_shape = list(tensor.shape)
-            pad_shape[shard_dim] = size - tensor.size(shard_dim)
-            return torch.cat((tensor, tensor.new_zeros(pad_shape)), dim=shard_dim)
+            # F.pad takes (before, after) pairs starting from the last dim
+            pad = [0, 0] * (tensor.ndim - 1 - shard_dim) + [0, pad_amount]
+            return torch.nn.functional.pad(tensor, pad)
 
         padded_U = [pad_to_size(u, padded_local_size) for u in U]
 
