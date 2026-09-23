@@ -28,8 +28,14 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-# This module intentionally compiles several matrix shapes in one process.
-torch._dynamo.config.recompile_limit = 64
+@pytest.fixture(autouse=True, scope="module")
+def _raise_recompile_limit():
+    # The muon_update_* helpers are @torch.compile(fullgraph=True), so every new
+    # matrix shape in this module recompiles them and fullgraph turns dynamo's
+    # recompile-limit fallback into a hard error. Scoped patch, restored on teardown.
+    with torch._dynamo.config.patch(recompile_limit=64):
+        yield
+
 
 from dion import Muon
 
@@ -185,23 +191,17 @@ def test_uneven_shards_nesterov_and_spectral_norm(mesh):
 
 
 # ---------------------------------------------------------------------------
-# torch.chunk vs torch.tensor_split disagree for these shapes, and Muon's
-# partitioned path splits per-row learning rates with tensor_split.
+# Regression tests: torch.chunk and torch.tensor_split disagree on these shapes
+# (4 rows on 3 ranks: chunk [2, 2, 0] vs tensor_split [2, 1, 1]). The partitioned
+# path once sliced per-row learning rates with tensor_split, so a rank whose
+# uneven shard crossed a partition boundary applied the wrong learning rate or
+# crashed on a broadcast mismatch. row_lr is now sliced with chunk offsets.
 # ---------------------------------------------------------------------------
 
 needs_world3 = pytest.mark.skipif(WORLD_SIZE != 3, reason="requires torchrun --nproc-per-node 3")
 
 
 @needs_world3
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "muon_update_batch_async splits row_lr with torch.tensor_split, but DTensor "
-        "Shard uses a torch.chunk layout: 4 rows on 3 ranks live [2, 2, 0] while "
-        "tensor_split gives [2, 1, 1], so rank 1 updates its row 3 with row 2's "
-        "partition learning rate."
-    ),
-)
 def test_partition_boundary_inside_an_uneven_shard(mesh):
     # Rank 1 holds rows 2 and 3, which sit in different partitions with different
     # spectral_norm learning rates; row 3 must not use row 2's rate.
@@ -211,15 +211,16 @@ def test_partition_boundary_inside_an_uneven_shard(mesh):
 
 
 @needs_world3
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "torch.chunk gives 7 rows on 3 ranks as [3, 3, 1] but tensor_split(row_lr, 3) "
-        "gives [3, 2, 2]: rank 1 receives 2 learning rates for 3 rows and the "
-        "broadcast in muon_update_post_orthogonalize_partitioned raises."
-    ),
-)
 def test_partitioned_rows_learning_rate_count_mismatch(mesh):
+    # chunk [3, 3, 1] vs tensor_split [3, 2, 2]: rank 1 needs 3 learning rates.
     assert_sharded_matches_local(
         mesh, (7, 8), shard_dim=0, partitions=(3, 4), adjust_lr="spectral_norm"
+    )
+
+
+@needs_world3
+def test_3d_partition_boundary_inside_an_uneven_shard(mesh):
+    # Rows live on dim 1 (ndim - 2): chunk [2, 2, 0] vs tensor_split [2, 1, 1].
+    assert_sharded_matches_local(
+        mesh, (2, 4, 8), shard_dim=1, partitions=(3, 1), adjust_lr="spectral_norm"
     )

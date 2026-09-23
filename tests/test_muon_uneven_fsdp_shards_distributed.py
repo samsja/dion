@@ -26,8 +26,14 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-# This module intentionally compiles several matrix shapes in one process.
-torch._dynamo.config.recompile_limit = 64
+@pytest.fixture(autouse=True, scope="module")
+def _raise_recompile_limit():
+    # The muon_update_* helpers are @torch.compile(fullgraph=True), so every new
+    # matrix shape in this module recompiles them and fullgraph turns dynamo's
+    # recompile-limit fallback into a hard error. Scoped patch, restored on teardown.
+    with torch._dynamo.config.patch(recompile_limit=64):
+        yield
+
 
 from dion import Muon
 
