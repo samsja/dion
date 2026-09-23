@@ -594,8 +594,12 @@ def muon_update_batch_async(
         # Every partition is a matrix of its own shape, so the adjustment varies by row
         row_lr = partition_row_learning_rates(partitions, X[0].size(-1), lr, adjust_lr)
         if shard_dim == X[0].ndim - 2:
-            # This device holds the same slice of rows for every parameter in the batch
-            row_lr = torch.tensor_split(row_lr, world_size, dim=0)[device_rank]
+            # This device holds the same slice of rows for every parameter in the
+            # batch. DTensor Shard uses a torch.chunk layout: every rank holds
+            # padded_local_size rows except a trailing short or empty shard, so
+            # slice with chunk offsets rather than torch.tensor_split.
+            start = min(device_rank * padded_local_size, row_lr.numel())
+            row_lr = row_lr.narrow(0, start, min(padded_local_size, row_lr.numel() - start))
         muon_update_post_orthogonalize_partitioned(
             X=to_local(X),
             U=U,
