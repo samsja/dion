@@ -489,22 +489,42 @@ def muon_update_batch_async(
         ), "process_group must be provided for sharded DTensors"
         assert isinstance(X[0], DTensor), "X should contain DTensors"
         assert not isinstance(U[0], DTensor), "U should contain local shards"
-        assert (
-            X[0].size(shard_dim) % world_size == 0
-        ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
+
+        # FSDP permits uneven shards, including empty local shards when the
+        # sharded dimension is smaller than the process group. NCCL all-to-all
+        # requires every peer transfer to have the same shape, so pad local
+        # shards for communication and remove that padding before Muon's matrix
+        # update. The reverse all-to-all uses the same padded shape and trims
+        # each rank back to its original local shard afterward.
+        global_shard_size = X[0].size(shard_dim)
+        padded_local_size = (global_shard_size + world_size - 1) // world_size
+        local_shard_size = U[0].size(shard_dim)
+        assert all(u.size(shard_dim) == local_shard_size for u in U)
+
+        def pad_to_size(tensor: Tensor, size: int) -> Tensor:
+            pad_amount = size - tensor.size(shard_dim)
+            if pad_amount == 0:
+                return tensor
+            # F.pad takes (before, after) pairs starting from the last dim
+            pad = [0, 0] * (tensor.ndim - 1 - shard_dim) + [0, pad_amount]
+            return torch.nn.functional.pad(tensor, pad)
+
+        padded_U = [pad_to_size(u, padded_local_size) for u in U]
 
         # Allocate buffers to receive shards of one whole matrix from other devices
-        single_matrix_shards = [torch.empty_like(u) for u in U]
+        single_matrix_shards = [torch.empty_like(padded_U[0]) for _ in U]
 
         # Redistribute the shards to form one unique full tensor on each device
         work = dist.all_to_all(
-            single_matrix_shards, U, group=process_group, async_op=True
+            single_matrix_shards, padded_U, group=process_group, async_op=True
         )
         yield
         work.wait()
 
-        # Concatentate shards to form a whole matrix to orthogonalize
+        # Concatenate shards and discard communication padding before
+        # orthogonalization so the update is exactly the unpadded Muon update.
         single_matrix = torch.cat(single_matrix_shards, dim=shard_dim)
+        single_matrix = single_matrix.narrow(shard_dim, 0, global_shard_size)
         single_matrix = muon_orthogonalize_update(
             single_matrix,
             partitions=partitions,
@@ -513,19 +533,22 @@ def muon_update_batch_async(
             epsilon=epsilon,
         )
 
-        # Split result back into shards
-        # Contiguous is needed for all-to-all to work correctly
+        # Re-pad the updated matrix so every reverse all-to-all transfer has the
+        # same shape, then trim this rank's received shards to its FSDP layout.
+        single_matrix = pad_to_size(single_matrix, padded_local_size * world_size)
         single_matrix_shards = [
             x.contiguous()
             for x in torch.tensor_split(single_matrix, world_size, dim=shard_dim)
         ]
 
         # Redistribute the orthogonalized tensor back to original layout
+        padded_U = [torch.empty_like(single_matrix_shards[0]) for _ in U]
         work = dist.all_to_all(
-            U, single_matrix_shards, group=process_group, async_op=True
+            padded_U, single_matrix_shards, group=process_group, async_op=True
         )
         yield
         work.wait()
+        U = [u.narrow(shard_dim, 0, local_shard_size) for u in padded_U]
 
     else:
         # Matrices are not sharded, so we can directly orthogonalize
@@ -571,8 +594,12 @@ def muon_update_batch_async(
         # Every partition is a matrix of its own shape, so the adjustment varies by row
         row_lr = partition_row_learning_rates(partitions, X[0].size(-1), lr, adjust_lr)
         if shard_dim == X[0].ndim - 2:
-            # This device holds the same slice of rows for every parameter in the batch
-            row_lr = torch.tensor_split(row_lr, world_size, dim=0)[device_rank]
+            # This device holds the same slice of rows for every parameter in the
+            # batch. DTensor Shard uses a torch.chunk layout: every rank holds
+            # padded_local_size rows except a trailing short or empty shard, so
+            # slice with chunk offsets rather than torch.tensor_split.
+            start = min(device_rank * padded_local_size, row_lr.numel())
+            row_lr = row_lr.narrow(0, start, min(padded_local_size, row_lr.numel() - start))
         muon_update_post_orthogonalize_partitioned(
             X=to_local(X),
             U=U,
