@@ -423,3 +423,49 @@ def test_hsdp_dense_with_misconfigured_meshes_is_wrong_without_check(
     monkeypatch.setattr(Muon, "_check_shard_group", staticmethod(lambda *args: None))
     sharded, expected = train_hsdp_dense(*hsdp_meshes(misconfiguration), layout)
     assert not torch.allclose(sharded, expected, rtol=1e-2, atol=1e-3)
+
+
+@functools.cache
+def fsdp_tp_mesh():
+    world_size = dist.get_world_size()
+    if world_size < 4 or world_size % 2 != 0:
+        pytest.skip("needs an even number of at least 4 ranks")
+    return init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("dp", "tp"))
+
+
+def train_fsdp_tp_dense(steps=2):
+    world_mesh = fsdp_tp_mesh()
+    torch.manual_seed(0)
+    shape, placements = (4 * world_mesh.size(0), 16), [Shard(0), Shard(1)]
+    weight = torch.randn(shape, device="cuda")
+    sharded = torch.nn.Parameter(distribute_tensor(weight.clone(), world_mesh, placements))
+    local = torch.nn.Parameter(weight.clone())
+    sharded_optimizer = Muon(
+        params=[dict(params=[sharded], algorithm="muon", distributed_mesh_name="dp")],
+        fsdp_mesh_dim=0,
+        world_mesh=world_mesh,
+        lr=0.02,
+        mu=0.95,
+        weight_decay=0.01,
+        adjust_lr="rms_norm",
+    )
+    local_optimizer = make_local_muon([local])
+    for _ in range(steps):
+        gradient = torch.randn(shape, device="cuda")
+        sharded.grad = distribute_tensor(gradient, world_mesh, placements)
+        local.grad = gradient.clone()
+        sharded_optimizer.step()
+        local_optimizer.step()
+    return sharded.detach().full_tensor(), local.detach()
+
+
+def test_two_sharded_matrix_dims_raise(mesh):
+    with pytest.raises(NotImplementedError, match="at most one sharded matrix dimension"):
+        train_fsdp_tp_dense()
+
+
+def test_two_sharded_matrix_dims_are_wrong_without_check(mesh, monkeypatch):
+    # Guards the check itself: gathering over FSDP alone orthogonalizes TP-partial matrices
+    monkeypatch.setattr(Muon, "_get_matrix_shard_dim", lambda self, *args: (0, False))
+    sharded, expected = train_fsdp_tp_dense()
+    assert not torch.allclose(sharded, expected, rtol=1e-2, atol=1e-3)

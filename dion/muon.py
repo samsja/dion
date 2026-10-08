@@ -372,23 +372,15 @@ class Muon(Optimizer):
             # Replicated matrices are split across devices; batch-sharded ones differ per device
             result = (None, has_batch_shard)
         else:
-            if len(shard_placements) == 1:
-                sharded_mesh_dim, placement = shard_placements[0]
-            else:
-                # Multiple matrix shards: Muon gathers over the FSDP mesh dimension
-                sharded_mesh_dim, placement = next(
-                    (
-                        (mesh_dim, placement)
-                        for mesh_dim, placement in shard_placements
-                        if mesh_dim == self.fsdp_mesh_dim
-                    ),
-                    (None, None),
+            # The all-to-all rebuilds matrices over one mesh dim; a second matrix shard (e.g. TP)
+            # would leave each device orthogonalizing a partial matrix
+            if len(shard_placements) > 1:
+                raise NotImplementedError(
+                    f"Muon supports at most one sharded matrix dimension, but a parameter with "
+                    f"placements {param.placements} is sharded on matrix dims over mesh dims "
+                    f"{[mesh_dim for mesh_dim, _ in shard_placements]}"
                 )
-                if placement is None:
-                    raise RuntimeError(
-                        f"Expected mesh_dim={self.fsdp_mesh_dim} to be sharded for FSDP, but "
-                        f"found sharded mesh dims: {[d for d, _ in shard_placements]}"
-                    )
+            sharded_mesh_dim, placement = shard_placements[0]
             if isinstance(placement, _StridedShard):
                 raise NotImplementedError(
                     f"Muon does not support {placement} on a matrix dimension of a parameter "
