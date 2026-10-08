@@ -2,7 +2,7 @@ import torch
 from collections import defaultdict
 from torch import Tensor
 from torch.distributed.tensor import DTensor
-from typing import Generator, List, Mapping, Optional, Tuple, Union
+from typing import Generator, List, Optional, Union
 
 
 def to_local(tensor: Union[Tensor, List[Tensor]]) -> Union[Tensor, List[Tensor]]:
@@ -46,21 +46,17 @@ def dtensor_from_local(
 
 
 def create_param_batches(
-    params: List[Tensor],
-    batch_size: int,
-    matrix_partitions: Optional[Mapping[Tensor, Tuple[int, ...]]] = None,
+    params: List[Tensor], batch_size: int
 ) -> Generator[List[Tensor], None, None]:
     """
     Batch parameters into groups of size `batch_size`.
-    Tensors in each batch will have identical shape, sharding, dtype, and matrix
-    partitioning, so the partitioning of any member describes the whole batch.
+    Tensors in each batch will have identical shape, sharding, and dtype.
     """
-    # Group parameters by shape, sharding, dtype, and matrix partitioning
+    # Group parameters by shape, sharding, and dtype
     groups = defaultdict(list)
     for p in params:
         sharding = p.placements if isinstance(p, DTensor) else None
-        partitions = matrix_partitions.get(p) if matrix_partitions is not None else None
-        groups[(p.shape, sharding, p.dtype, partitions)].append(p)
+        groups[(p.shape, sharding, p.dtype)].append(p)
 
     # Create batches from grouped parameters
     for group in groups.values():
