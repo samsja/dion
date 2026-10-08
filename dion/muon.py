@@ -4,7 +4,8 @@ import torch.distributed as dist
 from itertools import chain
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.distributed.tensor import DeviceMesh, DTensor
+from torch.distributed.tensor import DeviceMesh, DTensor, Shard
+from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Dict, Generator, List, Mapping, Optional, Sequence, Tuple, Union
 
@@ -167,6 +168,8 @@ class Muon(Optimizer):
                 "matrix_partitions contains parameters that were not given to the optimizer"
             )
 
+        self._matrix_shard_dims: Dict[tuple, Tuple[Optional[int], bool]] = {}
+
     @torch.no_grad()
     def step(self, closure=None):
         """
@@ -293,60 +296,28 @@ class Muon(Optimizer):
                 momentums = [s["momentum"] for s in states]
 
                 # Get sharding dimension
-                sharded_mesh_dim = None
                 sharded_tensor_dim = None
+                is_local = False
                 if isinstance(params[0], DTensor):
                     if not isinstance(distributed_mesh, DeviceMesh):
                         raise RuntimeError(
                             "Must create optimizer with DeviceMesh if using DTensor parameters."
                         )
+                    sharded_tensor_dim, is_local = self._get_matrix_shard_dim(
+                        params[0], flatten, process_group
+                    )
 
-                    # Find the sharded placement and get its mesh and tensor dimensions
-                    # Skip any Shard() placements on size-1 mesh dimension = Replicate()
-                    shard_placements = [
-                        (i, p)
-                        for i, p in enumerate(params[0].placements)
-                        if p.is_shard() and params[0].device_mesh.size(i) > 1
-                    ]
-                    if len(shard_placements) == 1:
-                        sharded_mesh_dim = shard_placements[0][0]
-                        sharded_tensor_dim = shard_placements[0][1].dim
-                    elif len(shard_placements) > 1:
-                    
-                        # print(f"HERREE {shard_placements=}")
-                        # most of the time it should look like this
-                        # shard_placements=[(0, _StridedShard(dim=0, sf=2)), (1, Shard(dim=0))]
-                        # matching_shard = shard_placements[0]
-                        
-                        
-                        # if low experts count aka  dp_mod_ep * ep > num_experts (in this case experts will shard for fsdp on dim 1)
-                        # shard_placements=[(0, Shard(dim=1)), (1, Shard(dim=0))]
-                        
-                        
-                        # if dp replicate and low experts count aka  dp_mod_ep * ep > num_experts (in this case experts will shard for fsdp on dim 1)
-                        # shard_placements=[(1, Shard(dim=1)), (2, Shard(dim=0))] 
-                                                
-                        # Multiple shards (e.g., FSDP + EP): assume mesh_dim=0 is FSDP dimension
-                        # When dp_mod_ep_mesh is used, FSDP is typically the first mesh dimension
-                        matching_shard = next(
-                            ((mesh_dim, p) for mesh_dim, p in shard_placements if mesh_dim == self.fsdp_mesh_dim),
-                            None
-                        )
-                        if matching_shard is None:
-                            raise RuntimeError(
-                                f"Expected mesh_dim=0 to be sharded for FSDP, but found sharded mesh dims: {[d for d, _ in shard_placements]}"
-                            )
-                            
-                        
-                        sharded_mesh_dim = matching_shard[0]
-                        sharded_tensor_dim = matching_shard[1].dim
-
+                # Local batches need no communication, so they skip the dummy padding
+                if not is_local:
+                    params = pad_batch(params, world_size)
+                    gradients = pad_batch(gradients, world_size)
+                    momentums = pad_batch(momentums, world_size)
 
                 yield AsyncTask(
                     muon_update_batch_async(
-                        X=pad_batch(params, world_size),
-                        G=pad_batch(gradients, world_size),
-                        M=pad_batch(momentums, world_size),
+                        X=params,
+                        G=gradients,
+                        M=momentums,
                         lr=lr,
                         momentum=mu,
                         weight_decay=weight_decay,
@@ -357,11 +328,92 @@ class Muon(Optimizer):
                         device_rank=device_rank,
                         world_size=world_size,
                         shard_dim=sharded_tensor_dim,
+                        is_local=is_local,
                         process_group=process_group,
                         newton_schulz_func=self._newton_schulz_func,
                         partitions=partitions,
                     )
                 )
+
+    def _get_matrix_shard_dim(
+        self,
+        param: DTensor,
+        flatten: bool,
+        process_group: Optional[ProcessGroup],
+    ) -> Tuple[Optional[int], bool]:
+        """
+        Return (tensor dim that Muon must gather over, whether every local shard is whole matrices).
+        """
+        cache_key = (param.device_mesh, param.placements, param.ndim, flatten, process_group)
+        if cache_key in self._matrix_shard_dims:
+            return self._matrix_shard_dims[cache_key]
+
+        # Skip any shard placements on size-1 mesh dimension = Replicate().
+        # _StridedShard is not a Shard subclass in newer torch releases, so check both.
+        shard_placements = [
+            (mesh_dim, placement)
+            for mesh_dim, placement in enumerate(param.placements)
+            if isinstance(placement, (Shard, _StridedShard))
+            and param.device_mesh.size(mesh_dim) > 1
+        ]
+        has_batch_shard = False
+        if not flatten:
+            # Shards on batch dims (e.g. the expert dim) leave whole matrices on every device
+            matrix_dims = (param.ndim - 2, param.ndim - 1)
+            matrix_shard_placements = [
+                (mesh_dim, placement)
+                for mesh_dim, placement in shard_placements
+                if placement.dim in matrix_dims
+            ]
+            has_batch_shard = len(matrix_shard_placements) < len(shard_placements)
+            shard_placements = matrix_shard_placements
+
+        if not shard_placements:
+            # Replicated matrices are split across devices; batch-sharded ones differ per device
+            result = (None, has_batch_shard)
+        else:
+            # The all-to-all rebuilds matrices over one mesh dim; a second matrix shard (e.g. TP)
+            # would leave each device orthogonalizing a partial matrix
+            if len(shard_placements) > 1:
+                raise NotImplementedError(
+                    f"Muon supports at most one sharded matrix dimension, but a parameter with "
+                    f"placements {param.placements} is sharded on matrix dims over mesh dims "
+                    f"{[mesh_dim for mesh_dim, _ in shard_placements]}"
+                )
+            sharded_mesh_dim, placement = shard_placements[0]
+            if isinstance(placement, _StridedShard):
+                raise NotImplementedError(
+                    f"Muon does not support {placement} on a matrix dimension of a parameter "
+                    f"with placements {param.placements}"
+                )
+
+            self._check_shard_group(param, sharded_mesh_dim, process_group)
+            result = (placement.dim, False)
+
+        self._matrix_shard_dims[cache_key] = result
+        return result
+
+    @staticmethod
+    def _check_shard_group(
+        param: DTensor, sharded_mesh_dim: int, process_group: Optional[ProcessGroup]
+    ):
+        """
+        Raise unless Muon's all-to-all runs over the parameter's shard ranks, in shard order.
+        """
+        # Group objects can differ for the same ranks (e.g. a separately built HSDP mesh), so
+        # compare ranks. Group ranks are sorted, but DTensor sizes shards by mesh coordinate,
+        # so the mesh must also list the shard ranks in ascending order.
+        mesh_index = list(param.device_mesh.get_coordinate())
+        mesh_index[sharded_mesh_dim] = slice(None)
+        shard_ranks = param.device_mesh.mesh[tuple(mesh_index)].tolist()
+        comm_ranks = (
+            dist.get_process_group_ranks(process_group) if process_group is not None else None
+        )
+        if shard_ranks != comm_ranks:
+            raise ValueError(
+                f"Parameter is sharded over ranks {shard_ranks}, but Muon communicates "
+                f"over ranks {comm_ranks}"
+            )
 
     def _create_lion_tasks(
         self,
@@ -458,6 +510,7 @@ def muon_update_batch_async(
     device_rank: int,  # Rank of the current device
     world_size: int,  # Total number of devices to parallelize over
     shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
+    is_local: bool = False,  # Whether every device holds whole matrices of its own
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     partitions: Optional[Tuple[int, ...]] = None,  # Independent matrices packed along dim -2
@@ -470,7 +523,7 @@ def muon_update_batch_async(
 
     assert len(X) == len(G)
     assert len(X) == len(M)
-    assert len(X) == world_size
+    assert is_local or len(X) == world_size
 
     # Update momentum and compute the inputs for orthogonalization
     U = muon_update_pre_orthogonalize(
@@ -481,7 +534,23 @@ def muon_update_batch_async(
     )
 
     # Get one whole matrix for each device to orthogonalize
-    if shard_dim is not None:
+    if is_local:
+        # Local shards are already whole matrices that differ across devices, so each
+        # device orthogonalizes its own without communication
+        U = [
+            u
+            if u.numel() == 0
+            else muon_orthogonalize_update(
+                u,
+                partitions=partitions,
+                newton_schulz_func=newton_schulz_func,
+                flatten=flatten,
+                epsilon=epsilon,
+            )
+            for u in U
+        ]
+
+    elif shard_dim is not None:
         # Use all-to-all to transform from a batch of shards to a single whole matrix
         # https://www.essential.ai/blog/infra
         assert (
