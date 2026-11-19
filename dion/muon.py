@@ -1,5 +1,6 @@
 import math
 import torch
+import weakref
 import torch.distributed as dist
 from itertools import chain
 from torch import Tensor
@@ -9,6 +10,17 @@ from torch.distributed.tensor.placement_types import _StridedShard
 from torch.optim.optimizer import Optimizer, ParamsT
 from typing import Callable, Dict, Generator, List, Mapping, Optional, Sequence, Tuple, Union
 
+from .muon_packed import (
+    PackedPlan,
+    exchange_buckets,
+    foreach_chunks,
+    foreach_length,
+    make_plan,
+    own_storage,
+    pad_dim,
+    pad_list,
+    shard_shape,
+)
 from .newton_schulz_triton import newton_schulz_triton
 from .opt_utils import (
     AsyncTask,
@@ -21,6 +33,9 @@ from .scalar_opts import (
     lion_update_foreach,
     adamw_update_foreach,
 )
+
+# Most matrices that one Newton-Schulz call batches across tensors
+NEWTON_SCHULZ_BATCH = 32
 
 
 class Muon(Optimizer):
@@ -46,7 +61,8 @@ class Muon(Optimizer):
         flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
             True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
             False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
-        use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        use_triton: Whether to use Triton kernels for Newton-Schulz on CUDA tensors instead of the
+            compiled PyTorch iteration. Ignored if custom function is provided.
         newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
             Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
         matrix_partitions: Maps a parameter to the sizes of the independent matrices packed
@@ -58,6 +74,8 @@ class Muon(Optimizer):
     Muon optimizer algorithm by Keller Jordan: https://kellerjordan.github.io/posts/muon/
     FSDP2 Muon uses all-to-all communications: https://www.essential.ai/blog/infra
     """
+
+    _pack_sharded_matrices = True
 
     def __init__(
         self,
@@ -73,7 +91,7 @@ class Muon(Optimizer):
         nesterov: bool = False,
         adjust_lr: Optional[str] = "spectral_norm",
         flatten: bool = False,
-        use_triton: bool = False,
+        use_triton: bool = True,
         newton_schulz_func: Optional[Callable] = None,
         matrix_partitions: Optional[Mapping[Tensor, Sequence[int]]] = None,
     ):
@@ -140,7 +158,7 @@ class Muon(Optimizer):
                 )
             self._newton_schulz_func = newton_schulz_func
         elif use_triton:
-            self._newton_schulz_func = newton_schulz_triton
+            self._newton_schulz_func = newton_schulz_triton_on_cuda
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
 
@@ -169,6 +187,7 @@ class Muon(Optimizer):
             )
 
         self._matrix_shard_dims: Dict[tuple, Tuple[Optional[int], bool]] = {}
+        self._packed_plans: Dict[tuple, Tuple[Tuple[weakref.ref, ...], PackedPlan]] = {}
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -283,6 +302,43 @@ class Muon(Optimizer):
             flatten = group["flatten"]
             adjust_lr = group["adjust_lr"]
 
+            # Matrices sharded on a matrix dim go whole to one owner rank each
+            packed, shard_dims, group_params = self._split_packed_params(
+                group_params, flatten, world_size, process_group, distributed_mesh
+            )
+            # Each bucket of sharded matrices is exchanged on its own, so the runtime
+            # overlaps one bucket's communication with another's Newton-Schulz
+            keys = [
+                (p.shape, p.dtype, shard_dim, self._matrix_partitions.get(p))
+                for p, shard_dim in zip(packed, shard_dims)
+            ]
+            for bucket in exchange_buckets(packed, keys, world_size):
+                params = [packed[i] for i in bucket]
+                partitions = [self._matrix_partitions.get(p) for p in params]
+                plan = self._get_packed_plan(
+                    params, [shard_dims[i] for i in bucket], partitions, world_size
+                )
+                yield AsyncTask(
+                    muon_update_packed_async(
+                        X=params,
+                        G=[p.grad for p in params],
+                        M=[self._get_or_initialize_state(p, algo_name)["momentum"] for p in params],
+                        plan=plan,
+                        partitions=partitions,
+                        lr=lr,
+                        momentum=mu,
+                        weight_decay=weight_decay,
+                        epsilon=epsilon,
+                        nesterov=nesterov,
+                        flatten=flatten,
+                        adjust_lr=adjust_lr,
+                        device_rank=device_rank,
+                        world_size=world_size,
+                        process_group=process_group,
+                        newton_schulz_func=self._newton_schulz_func,
+                    )
+                )
+
             # Create batches of parameters of size world_size
             for params in create_param_batches(
                 group_params,
@@ -334,6 +390,57 @@ class Muon(Optimizer):
                         partitions=partitions,
                     )
                 )
+
+    def _get_packed_plan(
+        self,
+        params: List[Tensor],
+        shard_dims: List[int],
+        partitions: List[Optional[Tuple[int, ...]]],
+        world_size: int,
+    ) -> PackedPlan:
+        """
+        The cached owner plan of a bucket, rebuilt unless it was made for these very tensors.
+        The cache holds weak references, so it neither keeps tensors alive nor trusts a reused id.
+        """
+        key = (tuple(id(p) for p in params), world_size)
+        cached = self._packed_plans.get(key)
+        if cached is None or any(ref() is not p for ref, p in zip(cached[0], params)):
+            self._packed_plans = {
+                k: v for k, v in self._packed_plans.items() if all(ref() is not None for ref in v[0])
+            }
+            cached = (
+                tuple(weakref.ref(p) for p in params),
+                make_plan(params, shard_dims, partitions, world_size),
+            )
+            self._packed_plans[key] = cached
+        return cached[1]
+
+    def _split_packed_params(
+        self,
+        params: List[Tensor],
+        flatten: bool,
+        world_size: int,
+        process_group: Optional[ProcessGroup],
+        distributed_mesh: Optional[Union[DeviceMesh, ProcessGroup]],
+    ) -> Tuple[List[Tensor], List[int], List[Tensor]]:
+        """
+        Split parameters into those sharded on a matrix dim, with that dim, and the rest.
+        """
+        packed, shard_dims, rest = [], [], []
+        for p in params:
+            if (
+                self._pack_sharded_matrices
+                and world_size > 1
+                and isinstance(p, DTensor)
+                and isinstance(distributed_mesh, DeviceMesh)
+            ):
+                shard_dim, is_local = self._get_matrix_shard_dim(p, flatten, process_group)
+                if shard_dim is not None and not is_local:
+                    packed.append(p)
+                    shard_dims.append(shard_dim)
+                    continue
+            rest.append(p)
+        return packed, shard_dims, rest
 
     def _get_matrix_shard_dim(
         self,
@@ -537,18 +644,12 @@ def muon_update_batch_async(
     if is_local:
         # Local shards are already whole matrices that differ across devices, so each
         # device orthogonalizes its own without communication
-        U = [
-            u
-            if u.numel() == 0
-            else muon_orthogonalize_update(
-                u,
-                partitions=partitions,
-                newton_schulz_func=newton_schulz_func,
-                flatten=flatten,
-                epsilon=epsilon,
-            )
-            for u in U
-        ]
+        U = muon_orthogonalize_local_batch(
+            U,
+            partitions=partitions,
+            newton_schulz_func=newton_schulz_func,
+            epsilon=epsilon,
+        )
 
     elif shard_dim is not None:
         # Use all-to-all to transform from a batch of shards to a single whole matrix
@@ -676,6 +777,207 @@ def muon_update_batch_async(
             row_lr=row_lr.unsqueeze(-1).to(X[0].device),
             weight_decay=weight_decay,
         )
+
+
+def muon_update_packed_async(
+    X: List[Tensor],  # Model weights (modified in place)
+    G: List[Tensor],  # Gradient
+    M: List[Tensor],  # Momentum buffer (modified in place)
+    plan: PackedPlan,  # Owner rank and shard sizes of every matrix
+    partitions: List[Optional[Tuple[int, ...]]],  # Independent matrices packed along dim -2
+    lr: Tensor,  # Learning rate (scalar tensor)
+    momentum: Tensor,  # Momentum factor (scalar tensor)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: Tensor,  # Epsilon (scalar tensor)
+    nesterov: bool,  # Whether to use Nesterov momentum
+    flatten: bool,  # Whether to flatten 3D+ tensors to 2D
+    adjust_lr: Optional[str],  # How to adjust learning rate
+    device_rank: int,  # Rank of the current device
+    world_size: int,  # Total number of devices to parallelize over
+    process_group: ProcessGroup,
+    newton_schulz_func: Callable,
+) -> Generator[None, None, None]:
+    """
+    Muon update for DTensors sharded on a matrix dim, of any shapes, each orthogonalized
+    whole by its owner rank. One all-to-all sends every owner the shards of its matrices
+    and one sends the orthogonalized shards back.
+    """
+    length = foreach_length(world_size)
+    U = muon_update_pre_orthogonalize_packed(G, M, momentum, nesterov, length)
+    owned = plan.owned_by(device_rank)
+    by_owner = [plan.owned_by(rank) for rank in range(world_size)]
+
+    def piece_numel(index: int, rank: int) -> int:
+        dim = plan.shard_dims[index]
+        return plan.shard_sizes[index][rank] * X[index].numel() // X[index].size(dim)
+
+    owner_splits = [sum(U[index].numel() for index in by_owner[rank]) for rank in range(world_size)]
+    owned_splits = [sum(piece_numel(index, rank) for index in owned) for rank in range(world_size)]
+
+    # Send every owner this rank's shards of its matrices
+    send = [U[index].reshape(-1) for rank in range(world_size) for index in by_owner[rank]]
+    outgoing = torch.cat(send) if send else U[0].new_empty(0)
+    received = U[0].new_empty(sum(owned_splits))
+    work = dist.all_to_all_single(
+        received,
+        outgoing,
+        output_split_sizes=owned_splits,
+        input_split_sizes=owner_splits,
+        group=process_group,
+        async_op=True,
+    )
+    yield
+    work.wait()
+    del outgoing
+
+    pieces: Dict[int, List[Tensor]] = {index: [] for index in owned}
+    for rank, chunk in enumerate(torch.split(received, owned_splits)):
+        flat = torch.split(chunk, [piece_numel(index, rank) for index in owned])
+        for index, piece in zip(owned, flat):
+            dim = plan.shard_dims[index]
+            pieces[index].append(piece.view(shard_shape(X[index], dim, plan.shard_sizes[index][rank])))
+
+    # Orthogonalize each owned matrix and cut it back into every rank's shard
+    back = []
+    for index in owned:
+        dim, padded = plan.shard_dims[index], plan.padded_sizes[index]
+        matrix = torch.cat([pad_dim(piece, dim, padded) for piece in pieces[index]], dim=dim)
+        matrix = matrix.narrow(dim, 0, X[index].size(dim))
+        matrix = muon_orthogonalize_update(
+            matrix,
+            partitions=partitions[index],
+            newton_schulz_func=newton_schulz_func,
+            flatten=flatten,
+            epsilon=epsilon,
+        )
+        # The return exchange is sized in the update's dtype on every rank, owners or not
+        matrix = pad_dim(matrix.to(dtype=U[index].dtype), dim, padded * world_size)
+        back.append(
+            [
+                shard.narrow(dim, 0, plan.shard_sizes[index][rank]).contiguous()
+                for rank, shard in enumerate(torch.tensor_split(matrix, world_size, dim=dim))
+            ]
+        )
+    del pieces, received
+
+    send = [back[k][rank].reshape(-1) for rank in range(world_size) for k in range(len(owned))]
+    outgoing = torch.cat(send) if send else U[0].new_empty(0)
+    del send, back
+    returned = U[0].new_empty(sum(owner_splits))
+    work = dist.all_to_all_single(
+        returned,
+        outgoing,
+        output_split_sizes=owner_splits,
+        input_split_sizes=owned_splits,
+        group=process_group,
+        async_op=True,
+    )
+    yield
+    work.wait()
+    del outgoing
+
+    updates: List[Optional[Tensor]] = [None] * len(X)
+    for rank, chunk in enumerate(torch.split(returned, owner_splits)):
+        flat = torch.split(chunk, [U[index].numel() for index in by_owner[rank]])
+        for index, piece in zip(by_owner[rank], flat):
+            updates[index] = piece.view(U[index].shape)
+    del U
+
+    # Partitioned matrices sharded on dim -2 need this rank's rows of the per-row learning rates
+    row_slices = []
+    for index, x in enumerate(X):
+        if partitions[index] is None or plan.shard_dims[index] != x.ndim - 2:
+            row_slices.append(None)
+            continue
+        padded = plan.padded_sizes[index]
+        start = min(device_rank * padded, x.size(-2))
+        row_slices.append((start, min(padded, x.size(-2) - start)))
+    muon_update_post_orthogonalize_packed(
+        X, updates, partitions, lr, weight_decay, adjust_lr, row_slices, length
+    )
+
+
+def muon_update_pre_orthogonalize_packed(
+    G: List[Tensor],
+    M: List[Tensor],
+    momentum: Tensor,
+    nesterov: bool,
+    length: int,
+) -> List[Tensor]:
+    """
+    muon_update_pre_orthogonalize on local shards, in lists of `length` entries of one shape
+    and dtype each.
+    """
+    local_grads, local_momentums = to_local(G), to_local(M)
+    lists: Dict[tuple, List[int]] = {}
+    for index, (local_grad, local_momentum) in enumerate(zip(local_grads, local_momentums)):
+        key = (local_momentum.shape, local_momentum.dtype, local_grad.dtype)
+        lists.setdefault(key, []).append(index)
+    U: List[Optional[Tensor]] = [None] * len(local_grads)
+    for indices in lists.values():
+        for chunk in foreach_chunks(indices, length):
+            outputs = muon_update_pre_orthogonalize(
+                G=pad_list([own_storage(local_grads[index]) for index in chunk], length),
+                M=pad_list([local_momentums[index] for index in chunk], length),
+                momentum=momentum,
+                nesterov=nesterov,
+            )
+            for index, update in zip(chunk, outputs):
+                U[index] = update
+    return U
+
+
+def muon_update_post_orthogonalize_packed(
+    X: List[Tensor],
+    updates: List[Tensor],
+    partitions: List[Optional[Tuple[int, ...]]],
+    lr: Tensor,
+    weight_decay: Tensor,
+    adjust_lr: Optional[str],
+    row_slices: List[Optional[Tuple[int, int]]],
+    length: int,
+):
+    """
+    The weight update of every matrix, in lists of `length` entries of one local shape,
+    learning rate and dtype. `row_slices` gives the (start, length) of this rank's rows of
+    each partitioned matrix sharded on dim -2.
+    """
+    plain: Dict[tuple, List[int]] = {}
+    partitioned: Dict[tuple, List[int]] = {}
+    row_lrs: Dict[tuple, Tensor] = {}
+    for index, x in enumerate(X):
+        parts = partitions[index]
+        if parts is None:
+            plain.setdefault((tuple(x.shape), to_local(x).shape, x.dtype), []).append(index)
+            continue
+        rows = row_slices[index]
+        lr_key = (parts, x.size(-1), rows)
+        if lr_key not in row_lrs:
+            row_lr = partition_row_learning_rates(parts, x.size(-1), lr, adjust_lr)
+            if rows is not None:
+                row_lr = row_lr.narrow(0, *rows)
+            row_lrs[lr_key] = row_lr.unsqueeze(-1).to(x.device)
+        partitioned.setdefault((lr_key, to_local(x).shape, x.dtype), []).append(index)
+
+    for (shape, _, _), indices in plain.items():
+        adjusted_lr = adjust_lr_for_shape(lr, torch.Size(shape), adjust_lr)
+        for chunk in foreach_chunks(indices, length):
+            muon_update_post_orthogonalize(
+                X=pad_list([to_local(X[index]) for index in chunk], length),
+                U=pad_list([own_storage(updates[index]) for index in chunk], length),
+                base_lr=lr,
+                adjusted_lr=adjusted_lr,
+                weight_decay=weight_decay,
+            )
+    for (lr_key, _, _), indices in partitioned.items():
+        for chunk in foreach_chunks(indices, length):
+            muon_update_post_orthogonalize_partitioned(
+                X=pad_list([to_local(X[index]) for index in chunk], length),
+                U=pad_list([own_storage(updates[index]) for index in chunk], length),
+                base_lr=lr,
+                row_lr=row_lrs[lr_key],
+                weight_decay=weight_decay,
+            )
 
 
 def adamw_update_foreach_async(
@@ -818,16 +1120,20 @@ def muon_orthogonalize_update(
 
     Without partitions this is a single Newton-Schulz over the whole tensor. With
     partitions, X packs several independent matrices along dimension -2, and each one
-    is orthogonalized on its own.
+    is orthogonalized on its own; equal partitions share one batched call.
     """
-    if partitions is None:
+    if partitions is None or len(partitions) == 1:
         return muon_update_newton_schulz(
             X, newton_schulz_func=newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
 
-    # TODO: when every partition has the same size, the packed rows reshape to
-    # [num_partitions, partition_size, fan_in] and Newton-Schulz runs once on the whole
-    # batch instead of once per partition. Worth doing when something fuses per-head Q/K/V.
+    if len(set(partitions)) == 1 and not (flatten and X.ndim >= 3):
+        # Equal partitions are a batch of matrices, orthogonalized in one call
+        blocks = X.unflatten(-2, (len(partitions), partitions[0]))
+        return muon_update_newton_schulz(
+            blocks, newton_schulz_func=newton_schulz_func, flatten=False, epsilon=epsilon
+        ).reshape(X.shape)
+
     updates = [
         # Newton-Schulz reads the partition many times, so pay for one contiguous copy
         muon_update_newton_schulz(
@@ -839,6 +1145,59 @@ def muon_orthogonalize_update(
         for partition in torch.split(X, partitions, dim=-2)
     ]
     return torch.cat(updates, dim=-2)
+
+
+def muon_orthogonalize_local_batch(
+    U: List[Tensor],
+    partitions: Optional[Tuple[int, ...]],
+    newton_schulz_func: Callable,
+    epsilon: Tensor,
+) -> List[Tensor]:
+    """
+    Orthogonalize same-shape tensors of whole matrices, e.g. each device's experts.
+
+    The matrices of tensors holding fewer than NEWTON_SCHULZ_BATCH matrices share
+    Newton-Schulz calls of up to that many matrices; a larger tensor is one call of its own.
+    Equal partitions count as matrices of their own.
+    """
+    if partitions is not None and len(set(partitions)) > 1:
+        return [
+            u
+            if u.numel() == 0
+            else muon_orthogonalize_update(
+                u,
+                partitions=partitions,
+                newton_schulz_func=newton_schulz_func,
+                flatten=False,
+                epsilon=epsilon,
+            )
+            for u in U
+        ]
+
+    rows = U[0].size(-2) if partitions is None else partitions[0]
+    stacks = {index: u.reshape(-1, rows, u.size(-1)) for index, u in enumerate(U) if u.numel()}
+    calls: List[List[int]] = []
+    count = 0
+    for index, stack in stacks.items():
+        if not calls or count + stack.size(0) > NEWTON_SCHULZ_BATCH:
+            calls.append([])
+            count = 0
+        calls[-1].append(index)
+        count += stack.size(0)
+
+    U = list(U)
+    for indices in calls:
+        batch = [stacks[index] for index in indices]
+        result = muon_update_newton_schulz(
+            torch.cat(batch) if len(batch) > 1 else batch[0],
+            newton_schulz_func=newton_schulz_func,
+            flatten=False,
+            epsilon=epsilon,
+        )
+        # Triton returns tall matrices transposed, so reshape rather than view
+        for index, piece in zip(indices, torch.split(result, [b.size(0) for b in batch])):
+            U[index] = piece.reshape(U[index].shape)
+    return U
 
 
 def partition_row_learning_rates(
@@ -899,6 +1258,15 @@ def adjust_lr_keller_muon(lr, param_shape):
     fan_out, fan_in = param_shape[-2:] # need -2: instead of 2: because it would break experts params that are 3d
     adjusted_lr = lr * max(1, fan_out / fan_in)**0.5
     return adjusted_lr
+
+def newton_schulz_triton_on_cuda(G: Tensor, epsilon: float = 1e-7) -> Tensor:
+    """
+    Triton Newton-Schulz for CUDA tensors, the compiled PyTorch iteration for others.
+    """
+    if G.is_cuda:
+        return newton_schulz_triton(G, epsilon=epsilon)
+    return zeropower_via_newtonschulz5(G, epsilon=epsilon)
+
 
 @torch.compile(fullgraph=True)
 def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):

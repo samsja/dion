@@ -4,25 +4,35 @@ import triton.language as tl
 from torch import Tensor
 
 
-def _get_autotune_configs():
-    return [
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": bm,
-                "BLOCK_SIZE_N": bn,
-                "BLOCK_SIZE_K": bk,
-                "GROUP_SIZE_M": 8,
-                "LOWER_UPPER": 1,
-            },
-            num_stages=stages,
-            num_warps=warps,
-        )
-        for bm in [64, 128]
-        for bn in [64, 128, 256]
-        for bk in [64, 128]
-        for stages, warps in [(3, 4), (3, 8), (4, 4)]
-        if bm // bn <= 2 and bn // bm <= 2
-    ]
+def _config(bm: int, bn: int, bk: int, stages: int, warps: int) -> dict:
+    return {
+        "BLOCK_SIZE_M": bm,
+        "BLOCK_SIZE_N": bn,
+        "BLOCK_SIZE_K": bk,
+        "GROUP_SIZE_M": 8,
+        "LOWER_UPPER": 1,
+        "num_stages": stages,
+        "num_warps": warps,
+    }
+
+
+# Launch configs are fixed by the output size M instead of autotuned. Triton's autotuner times
+# candidates in each process and keeps the fastest, so two ranks that orthogonalize the same
+# matrix independently (HSDP replicas, replicated parameters) can pick different configs. A
+# different config can round differently, and the replicas' weights would then drift apart
+# silently. A config chosen from the shape alone is the same on every rank. Autotuning also
+# compiled and timed every candidate per new shape, which cost minutes at the first step.
+# Configs were chosen on B200 from the former autotune list; per size class, the total kernel
+# time over a large mixture-of-experts model's matrix shapes is within 7% of the per-shape best.
+# Reintroducing autotuning would call for a check that HSDP replicas stay equal, for example an
+# all-reduce of a weight checksum across the replicate dimension every few steps.
+LARGE_OUTPUT = 2048
+NS_LINE_1_CONFIGS = (_config(64, 64, 128, 4, 4), _config(128, 256, 64, 4, 4))
+NS_LINE_2_CONFIGS = (_config(64, 64, 64, 4, 4), _config(128, 256, 64, 3, 8))
+
+
+def _launch_config(configs: tuple, M: int) -> dict:
+    return configs[M >= LARGE_OUTPUT]
 
 
 @triton.jit
@@ -55,10 +65,6 @@ def _pid_to_block(
     return batch_idx, m_idx, n_idx
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "K", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
 @triton.jit
 def ns_line_1_kernel(
     A_ptr,
@@ -149,10 +155,11 @@ def ns_line_1(A: Tensor, *, out: Tensor = None):
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
 
-    grid = lambda meta: (
+    config = _launch_config(NS_LINE_1_CONFIGS, M)
+    grid = (
         batch_size
-        * triton.cdiv(M, meta["BLOCK_SIZE_M"])
-        * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+        * triton.cdiv(M, config["BLOCK_SIZE_M"])
+        * triton.cdiv(M, config["BLOCK_SIZE_N"]),
     )
     ns_line_1_kernel[grid](
         A_ptr=A,
@@ -165,15 +172,12 @@ def ns_line_1(A: Tensor, *, out: Tensor = None):
         c_stride_b=output_batch_stride,
         c_stride_r=out.stride(-2),
         c_stride_c=out.stride(-1),
+        **config,
     )
 
     return out
 
 
-@triton.autotune(
-    configs=_get_autotune_configs(),
-    key=["M", "a_stride_r", "a_stride_c", "c_stride_r", "c_stride_c"],
-)
 @triton.jit
 def ns_line_2_kernel(
     A_ptr,
@@ -280,10 +284,11 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
     input_batch_stride = A.stride(0) if A.ndim == 3 else 0
     output_batch_stride = out.stride(0) if out.ndim == 3 else 0
 
-    grid = lambda meta: (
+    config = _launch_config(NS_LINE_2_CONFIGS, M)
+    grid = (
         batch_size
-        * triton.cdiv(M, meta["BLOCK_SIZE_M"])
-        * triton.cdiv(M, meta["BLOCK_SIZE_N"]),
+        * triton.cdiv(M, config["BLOCK_SIZE_M"])
+        * triton.cdiv(M, config["BLOCK_SIZE_N"]),
     )
     ns_line_2_kernel[grid](
         A_ptr=A,
@@ -297,6 +302,7 @@ def ns_line_2(A: Tensor, alpha: float, beta: float, *, out: Tensor = None):
         c_stride_c=out.stride(-1),
         alpha=alpha,
         beta=beta,
+        **config,
     )
 
     return out
@@ -333,10 +339,10 @@ def zeropower_via_newtonschulz5(G: Tensor, epsilon: float = 1e-7):
     return X
 
 
-@torch.compile(dynamic=False, fullgraph=True)
 def newton_schulz_triton(G: Tensor, epsilon: float = 1e-7):
     """
-    Triton implementation of Newton-Schulz iteration
+    Triton implementation of Newton-Schulz iteration. Not compiled: the kernels need no graph,
+    and a compiled wrapper would compile one graph per input shape.
     """
     # Newton-Schulz constants
     ns_consts = [

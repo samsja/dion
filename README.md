@@ -127,7 +127,7 @@ For faster performance, both of these optimizers will process parameters in batc
 We include Dion, Muon, and several alternative implementations of the optimizers in the `optimizers/` directory of this repo.
  
 * `dion.py`: High-performance version of Dion. Depending on how each batch of matrices is sharded, we select the best communication patterns to compute Dion's orthonormal update. All-reduce operations may be split into reduce-scatter and all-gather across the batch dimension to more efficiently distribute work and avoid redundant computation.
-* `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
+* `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute matrices of any shapes, each whole matrix to one owner device (balanced by Newton-Schulz cost), in buckets of bounded size. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
 * `dion_reference.py`: An implementation without batching, communication overlapping, or split all-reduce. This version of Dion is intended to closely follow the algorithms as described in our [Dion paper](https://arxiv.org/pdf/2504.05295).
 * `dion_simple.py`: A simplified illustration of the Dion update rule in a single Python function, provided for educational value.
 * `muon_reference.py`: A version of Muon by [Moonshot AI](https://github.com/MoonshotAI/Moonlight), modified to take similar arguments as `muon.py`.

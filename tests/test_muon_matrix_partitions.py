@@ -124,3 +124,24 @@ def test_partitions_must_belong_to_the_optimizer():
     other = torch.nn.Parameter(torch.randn(384, 128, device=DEVICE))
     with pytest.raises(ValueError, match="not given to the optimizer"):
         make_muon([parameter], {other: (192, 192)})
+
+
+def test_default_newton_schulz_runs_on_cpu():
+    torch.manual_seed(0)
+    weights = [torch.randn(32, 16), torch.randn(4, 8, 16)]
+    grads = [torch.randn_like(w) for w in weights]
+    results = []
+    for use_triton in (True, False):
+        params = [torch.nn.Parameter(w.clone()) for w in weights]
+        optimizer = Muon(
+            params=[dict(params=params, algorithm="muon")],
+            fsdp_mesh_dim=0,
+            world_mesh=None,
+            use_triton=use_triton,
+        )
+        for param, grad in zip(params, grads):
+            param.grad = grad.clone()
+        optimizer.step()
+        results.append([param.detach() for param in params])
+    for default, reference in zip(*results):
+        torch.testing.assert_close(default, reference, rtol=0, atol=0)
