@@ -419,8 +419,10 @@ def test_hsdp_dense_with_misconfigured_meshes_raises(mesh, layout, misconfigurat
 def test_hsdp_dense_with_misconfigured_meshes_is_wrong_without_check(
     mesh, monkeypatch, misconfiguration, layout
 ):
-    # Guards the check itself: each misconfiguration it rejects really corrupts the update
+    # Guards the check itself: each misconfiguration it rejects really corrupts the update.
+    # Packed exchanges would disagree on their split sizes across ranks, so use the batched path.
     monkeypatch.setattr(Muon, "_check_shard_group", staticmethod(lambda *args: None))
+    monkeypatch.setattr(Muon, "_pack_sharded_matrices", False)
     sharded, expected = train_hsdp_dense(*hsdp_meshes(misconfiguration), layout)
     assert not torch.allclose(sharded, expected, rtol=1e-2, atol=1e-3)
 
@@ -465,7 +467,9 @@ def test_two_sharded_matrix_dims_raise(mesh):
 
 
 def test_two_sharded_matrix_dims_are_wrong_without_check(mesh, monkeypatch):
-    # Guards the check itself: gathering over FSDP alone orthogonalizes TP-partial matrices
+    # Guards the check itself: gathering over FSDP alone orthogonalizes TP-partial matrices.
+    # Packed exchanges would disagree on their split sizes across ranks, so use the batched path.
     monkeypatch.setattr(Muon, "_get_matrix_shard_dim", lambda self, *args: (0, False))
+    monkeypatch.setattr(Muon, "_pack_sharded_matrices", False)
     sharded, expected = train_fsdp_tp_dense()
     assert not torch.allclose(sharded, expected, rtol=1e-2, atol=1e-3)
